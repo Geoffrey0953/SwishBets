@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "swishbets"
+version = "0.1.0"
+description = "NBA sports betting analysis MCP server"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "redis>=5.0.0",
+    "httpx>=0.27.0",
+    "nba_api>=1.4.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "uvicorn[standard]>=0.30.0",
+    "starlette>=0.40.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+swishbets = "swishbets.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["swishbets"]
