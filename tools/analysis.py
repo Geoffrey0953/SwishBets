@@ -4,9 +4,9 @@ from datetime import date, datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
 
-from swishbets.cache.ttl_cache import RedisCache
-from swishbets.services.analysis_service import AnalysisService
-from swishbets.services.odds_service import OddsService
+from cache.ttl_cache import RedisCache
+from services.analysis_service import AnalysisService
+from services.odds_service import OddsService
 
 _cache: RedisCache
 _analysis_service: AnalysisService

@@ -6,9 +6,9 @@ from typing import Any, Optional
 
 import httpx
 
-from swishbets.cache.ttl_cache import RedisCache, ODDS, PROPS
-from swishbets.config import settings
-from swishbets.models.schemas import (
+from cache.ttl_cache import RedisCache, ODDS, PROPS
+from config import settings
+from models.schemas import (
     Game,
     LineMovement,
     OddsLine,
@@ -26,14 +26,22 @@ class OddsService:
         self.base_url = settings.odds_api_base_url
         self.api_key = settings.the_odds_api_key
 
-    def _headers(self) -> dict[str, str]:
-        return {"apikey": self.api_key}
-
     async def _get(self, path: str, params: Optional[dict] = None) -> Any:
         url = f"{self.base_url}{path}"
+        merged = {"apiKey": self.api_key, **(params or {})}
+        print(f"[API CALL]   The Odds API → {path}")
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(url, params=params, headers=self._headers())
-            resp.raise_for_status()
+            resp = await client.get(url, params=merged)
+            if not resp.is_success:
+                try:
+                    body = resp.json()
+                    msg = body.get("message", resp.text)
+                    code = body.get("error_code", "")
+                    raise ValueError(f"Odds API error ({resp.status_code}){f' [{code}]' if code else ''}: {msg}")
+                except (ValueError, KeyError):
+                    raise
+                except Exception:
+                    resp.raise_for_status()
             return resp.json()
 
     async def get_games(
@@ -81,7 +89,7 @@ class OddsService:
 
         data = await self._get(
             f"/sports/basketball_nba/events/{event_id}/odds",
-            params={"markets": ",".join(markets), "oddsFormat": "american"},
+            params={"markets": ",".join(markets), "oddsFormat": "american", "regions": "us"},
         )
 
         lines: list[OddsLine] = []
@@ -147,7 +155,7 @@ class OddsService:
 
         data = await self._get(
             f"/sports/basketball_nba/events/{event_id}/odds",
-            params={"markets": ",".join(markets), "oddsFormat": "american"},
+            params={"markets": ",".join(markets), "oddsFormat": "american", "regions": "us"},
         )
 
         props: list[PlayerProp] = []

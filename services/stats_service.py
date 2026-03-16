@@ -6,9 +6,9 @@ from typing import Any, Optional
 
 import httpx
 
-from swishbets.cache.ttl_cache import RedisCache, INJURIES, SCHEDULE, STATS
-from swishbets.config import settings
-from swishbets.models.schemas import (
+from cache.ttl_cache import RedisCache, INJURIES, SCHEDULE, STATS
+from config import settings
+from models.schemas import (
     Game,
     HeadToHeadResult,
     InjuryPlayer,
@@ -70,6 +70,7 @@ class StatsService:
             return [Game(**g) for g in cached]
 
         try:
+            print(f"[API CALL]   nba_api → Scoreboard.get_data_frame() for {game_date}")
             board = self._get_scoreboard(game_date)
             games_df = board.game_header.get_data_frame()
             games: list[Game] = []
@@ -97,6 +98,7 @@ class StatsService:
             return TeamStats(**cached)
 
         try:
+            print(f"[API CALL]   nba_api → TeamGameLogs.get_data_frame() team={team_id} last_n={last_n}")
             logs = self._get_team_game_logs(team_id, last_n)
             df = logs.team_game_logs.get_data_frame()
 
@@ -151,6 +153,7 @@ class StatsService:
             return cached
 
         try:
+            print(f"[API CALL]   nba_api → PlayerGameLogs.get_data_frame() player={player_id}")
             logs = self._get_player_game_logs(player_id)
             df = logs.player_game_logs.get_data_frame()
             result = df.head(10).to_dict(orient="records")
@@ -170,10 +173,12 @@ class StatsService:
             return HeadToHeadResult(**cached)
 
         try:
+            print(f"[API CALL]   nba_api → TeamGameLogs.get_data_frame() team={team1_id} last_n=82")
             logs1 = self._get_team_game_logs(team1_id, 82)
             df1 = logs1.team_game_logs.get_data_frame()
             team1_name = str(df1["TEAM_NAME"].iloc[0]) if not df1.empty else "Team1"
 
+            print(f"[API CALL]   nba_api → TeamGameLogs.get_data_frame() team={team2_id} last_n=82")
             logs2 = self._get_team_game_logs(team2_id, 82)
             df2 = logs2.team_game_logs.get_data_frame()
             team2_name = str(df2["TEAM_NAME"].iloc[0]) if not df2.empty else "Team2"
@@ -237,6 +242,7 @@ class StatsService:
                     f"{settings.sportsradar_base_url}/seasons/{settings.nba_season_year}/REG/injuries.json"
                 )
                 params = {"api_key": settings.sportsradar_api_key}
+                print(f"[API CALL]   SportsRadar → /seasons/{settings.nba_season_year}/REG/injuries.json team={team_id}")
                 async with httpx.AsyncClient(timeout=15) as client:
                     resp = await client.get(url, params=params)
                     resp.raise_for_status()
@@ -275,6 +281,7 @@ class StatsService:
             return cached
 
         try:
+            print(f"[API CALL]   nba_api → LeagueStandingsV3.get_data_frame()")
             standings = self._get_standings()
             df = standings.standings.get_data_frame()
             records = df[
@@ -304,6 +311,7 @@ class StatsService:
             return [Team(**t) for t in cached]
 
         try:
+            print("[API CALL]   nba_api → teams.get_teams()")
             from nba_api.stats.static import teams as nba_teams
 
             raw = nba_teams.get_teams()
@@ -330,6 +338,7 @@ class StatsService:
             return [Player(**p) for p in cached]
 
         try:
+            print("[API CALL]   nba_api → players.get_active_players()")
             from nba_api.stats.static import players as nba_players
 
             raw = nba_players.get_active_players()

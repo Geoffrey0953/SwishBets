@@ -8,11 +8,11 @@ from datetime import date
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 
-from swishbets.cache.ttl_cache import RedisCache
-from swishbets.config import settings
-from swishbets.services.analysis_service import AnalysisService
-from swishbets.services.odds_service import OddsService
-from swishbets.services.stats_service import StatsService
+from cache.ttl_cache import RedisCache
+from config import settings
+from services.analysis_service import AnalysisService
+from services.odds_service import OddsService
+from services.stats_service import StatsService
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,9 +43,9 @@ analysis_service = AnalysisService(odds_service, stats_service)
 # ---------------------------------------------------------------------------
 # Register tools
 # ---------------------------------------------------------------------------
-from swishbets.tools import odds as odds_tools
-from swishbets.tools import stats as stats_tools
-from swishbets.tools import analysis as analysis_tools
+from tools import odds as odds_tools
+from tools import stats as stats_tools
+from tools import analysis as analysis_tools
 
 odds_tools.register(mcp, cache, odds_service)
 stats_tools.register(mcp, cache, stats_service)

@@ -32,8 +32,10 @@ class RedisCache:
             raw = await client.get(key)
             if raw is None:
                 logger.debug("Cache MISS: %s", key)
+                print(f"[CACHE MISS] {key}")
                 return None
             logger.debug("Cache HIT: %s", key)
+            print(f"[CACHE HIT]  {key}")
             return json.loads(raw)
         except Exception as exc:
             logger.warning("Redis GET error for key %s: %s", key, exc)

@@ -20,7 +20,8 @@ dependencies = [
 ]
 
 [project.scripts]
-swishbets = "swishbets.server:main"
+swishbets = "server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["swishbets"]
+packages = ["cache", "models", "services", "tools"]
+include = ["server.py", "config.py"]

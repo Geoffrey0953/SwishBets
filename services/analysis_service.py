@@ -8,10 +8,10 @@ from typing import Any, Optional
 
 import httpx
 
-from swishbets.config import settings
-from swishbets.models.schemas import ValueBet
-from swishbets.services.odds_service import OddsService
-from swishbets.services.stats_service import StatsService
+from config import settings
+from models.schemas import ValueBet
+from services.odds_service import OddsService
+from services.stats_service import StatsService
 
 logger = logging.getLogger(__name__)
 

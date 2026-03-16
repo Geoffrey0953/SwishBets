@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
-from swishbets.cache.ttl_cache import RedisCache
-from swishbets.services.stats_service import StatsService
+from cache.ttl_cache import RedisCache
+from services.stats_service import StatsService
 
 _cache: RedisCache
 _stats_service: StatsService

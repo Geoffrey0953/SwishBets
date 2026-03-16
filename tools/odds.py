@@ -5,9 +5,9 @@ from datetime import date, datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
 
-from swishbets.cache.ttl_cache import RedisCache
-from swishbets.config import settings
-from swishbets.services.odds_service import OddsService
+from cache.ttl_cache import RedisCache
+from config import settings
+from services.odds_service import OddsService
 
 # These are populated by server.py at startup
 _cache: RedisCache
@@ -114,9 +114,12 @@ def register(mcp: FastMCP, cache: RedisCache, odds_service: OddsService) -> None
         """Show how the spread line has shifted since it opened.
 
         Args:
-            game_id: The game ID.
+            game_id: The game ID returned by get_tonight_games.
         """
-        movement = await _odds_service.get_line_movement(game_id)
+        try:
+            movement = await _odds_service.get_line_movement(game_id)
+        except ValueError as exc:
+            return f"Could not fetch line movement for `{game_id}`: {exc}\n\nTip: use `get_tonight_games` to get a valid game ID."
         direction_emoji = {"Up": "⬆", "Down": "⬇", "Flat": "➡"}.get(
             movement.direction, ""
         )
