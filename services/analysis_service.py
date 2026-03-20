@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import statistics
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
@@ -165,6 +165,22 @@ class AnalysisService:
             logger.warning("Could not fetch props for %s: %s", event_id, exc)
             return []
 
+        if not props:
+            return []
+
+        # Determine commence_time from the first prop's event odds
+        commence_time: Optional[datetime] = None
+        try:
+            lines = await self.odds.get_odds(event_id, markets=["h2h"])
+            if lines:
+                commence_time = lines[0].commence_time
+        except Exception:
+            pass
+
+        # Fetch opening prop lines for all markets at once
+        markets_needed = list({p.market for p in props})
+        opening_lines = await self._get_opening_prop_lines(event_id, commence_time, markets_needed)
+
         value_bets: list[ValueBet] = []
 
         for prop in props:
@@ -202,11 +218,32 @@ class AnalysisService:
                 implied_over = self.implied_probability(prop.over_price)
                 implied_under = self.implied_probability(prop.under_price)
 
+                # Opening line for this player+market (for line movement signal)
+                opening_line = opening_lines.get(prop.player_name, {}).get(prop.market)
+
                 for direction, true_prob, implied_prob, american_odds in [
                     ("Over", true_over_prob, implied_over, prop.over_price),
                     ("Under", true_under_prob, implied_under, prop.under_price),
                 ]:
                     edge = self.calculate_edge(true_prob, implied_prob)
+
+                    line_movement_label: Optional[str] = None
+                    if opening_line is not None:
+                        line_delta = prop.line - opening_line
+                        if abs(line_delta) >= 0.25:
+                            # Agrees: line moved up + Over, or moved down + Under
+                            agrees = (line_delta > 0 and direction == "Over") or (
+                                line_delta < 0 and direction == "Under"
+                            )
+                            if agrees:
+                                edge += 0.015
+                                arrow = "↑" if line_delta > 0 else "↓"
+                                line_movement_label = f"{line_delta:+.1f} {arrow} (agrees)"
+                            else:
+                                edge -= 0.010
+                                arrow = "↑" if line_delta > 0 else "↓"
+                                line_movement_label = f"{line_delta:+.1f} {arrow} (disagrees)"
+
                     if edge >= EDGE_THRESHOLD:
                         decimal = self.american_to_decimal(american_odds)
                         label = f"{prop.player_name} {direction} {prop.line} {prop.market}"
@@ -222,6 +259,7 @@ class AnalysisService:
                                 edge=round(edge, 4),
                                 kelly_fraction=self.kelly_criterion(edge, decimal),
                                 confidence=self._confidence(edge),
+                                line_movement=line_movement_label,
                             )
                         )
             except Exception as exc:
@@ -270,6 +308,40 @@ class AnalysisService:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    async def _get_opening_prop_lines(
+        self,
+        event_id: str,
+        commence_time: Optional[datetime],
+        markets: list[str],
+    ) -> dict[str, dict[str, float]]:
+        """Return {player_name: {market: opening_line}} from 48h-before snapshot."""
+        if commence_time is None or not markets:
+            return {}
+
+        opening_ts = (commence_time - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            hist = await self.odds.get_historical_event_odds(event_id, opening_ts, markets=markets)
+        except Exception as exc:
+            logger.debug("Could not fetch opening prop lines: %s", exc)
+            return {}
+
+        hist_data = hist.get("data") or {}
+        result: dict[str, dict[str, float]] = {}
+
+        for bookmaker in hist_data.get("bookmakers", []):
+            for market in bookmaker.get("markets", []):
+                market_key = market.get("key", "")
+                for outcome in market.get("outcomes", []):
+                    player_name = outcome.get("description", outcome.get("name", ""))
+                    if not player_name or "point" not in outcome:
+                        continue
+                    result.setdefault(player_name, {})
+                    # Only set if not already seen (first bookmaker wins)
+                    if market_key not in result[player_name]:
+                        result[player_name][market_key] = float(outcome["point"])
+
+        return result
 
     async def _find_player(self, name: str) -> Optional[dict[str, Any]]:
         try:

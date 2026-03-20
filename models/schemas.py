@@ -124,6 +124,7 @@ class ValueBet(BaseModel):
     edge: float  # true_prob - implied_prob
     kelly_fraction: float
     confidence: str  # "Low", "Medium", "High"
+    line_movement: Optional[str] = None  # e.g. "+1.5 ↑ (agrees)" or None
 
 
 class LineMovement(BaseModel):

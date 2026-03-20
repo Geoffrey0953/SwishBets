@@ -81,14 +81,15 @@ def register(
 
         rows = [
             f"**Value Props — `{game_id}` (last {last_n_games} games)**\n",
-            "| Selection | Book | Odds | Implied% | True% | Edge | Kelly | Confidence |",
-            "|-----------|------|------|----------|-------|------|-------|------------|",
+            "| Selection | Book | Odds | Implied% | True% | Edge | Kelly | Confidence | Line Mvmt |",
+            "|-----------|------|------|----------|-------|------|-------|------------|-----------|",
         ]
         for b in bets:
             rows.append(
                 f"| {b.selection} | {b.bookmaker} | {b.american_odds:+d} | "
                 f"{b.implied_probability:.1%} | {b.true_probability:.1%} | "
-                f"{b.edge:.1%} | {b.kelly_fraction:.1%} | {b.confidence} |"
+                f"{b.edge:.1%} | {b.kelly_fraction:.1%} | {b.confidence} | "
+                f"{b.line_movement or '—'} |"
             )
         return "\n".join(rows)
 

@@ -109,7 +109,13 @@ class StatsService:
             losses = int((df["WL"] == "L").sum())
             played = len(df)
             ppg = float(df["PTS"].mean())
-            papg = float(df["PTS_OPP"].mean()) if "PTS_OPP" in df.columns else 0.0
+            # TeamGameLogs doesn't return PTS_OPP; derive it from PLUS_MINUS
+            if "PTS_OPP" in df.columns:
+                papg = float(df["PTS_OPP"].mean())
+            elif "PLUS_MINUS" in df.columns:
+                papg = float((df["PTS"] - df["PLUS_MINUS"]).mean())
+            else:
+                papg = 0.0
             pace = float(df["PACE"].mean()) if "PACE" in df.columns else None
             off_rtg = float(df["OFF_RATING"].mean()) if "OFF_RATING" in df.columns else None
             def_rtg = float(df["DEF_RATING"].mean()) if "DEF_RATING" in df.columns else None
@@ -191,9 +197,10 @@ class StatsService:
             team1_wins = int((matchups["WL"] == "W").sum())
             team2_wins = int((matchups["WL"] == "L").sum())
             team1_avg = float(matchups["PTS"].mean()) if not matchups.empty else 0.0
-            # PTS_OPP may not be available — use a safe fallback
             if "PTS_OPP" in matchups.columns and not matchups.empty:
                 team2_avg = float(matchups["PTS_OPP"].mean())
+            elif "PLUS_MINUS" in matchups.columns and not matchups.empty:
+                team2_avg = float((matchups["PTS"] - matchups["PLUS_MINUS"]).mean())
             else:
                 team2_avg = 0.0
 
@@ -238,18 +245,16 @@ class StatsService:
 
         if settings.sportsradar_api_key:
             try:
-                url = (
-                    f"{settings.sportsradar_base_url}/seasons/{settings.nba_season_year}/REG/injuries.json"
-                )
+                url = f"{settings.sportsradar_base_url}/league/injuries.json"
                 params = {"api_key": settings.sportsradar_api_key}
-                print(f"[API CALL]   SportsRadar → /seasons/{settings.nba_season_year}/REG/injuries.json team={team_id}")
+                print(f"[API CALL]   SportsRadar → /league/injuries.json team={team_id}")
                 async with httpx.AsyncClient(timeout=15) as client:
                     resp = await client.get(url, params=params)
                     resp.raise_for_status()
                     data = resp.json()
 
                 for team in data.get("teams", []):
-                    if str(team.get("id")) == str(team_id):
+                    if str(team.get("reference")) == str(team_id):
                         team_name = team.get("name", "Unknown")
                         for p in team.get("players", []):
                             injuries = p.get("injuries", [])

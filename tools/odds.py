@@ -22,7 +22,7 @@ def register(mcp: FastMCP, cache: RedisCache, odds_service: OddsService) -> None
     @mcp.tool()
     async def get_tonight_games() -> str:
         """Return tonight's NBA games with tip-off times."""
-        today = datetime.now(tz=timezone.utc).date()
+        today = date.today()
         games = await _odds_service.get_games(game_date=today)
         if not games:
             return "No NBA games found for tonight."

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
 
-from cache.ttl_cache import RedisCache, ODDS, PROPS
+from cache.ttl_cache import RedisCache, HISTORICAL, ODDS, PROPS
 from config import settings
 from models.schemas import (
     Game,
@@ -60,7 +60,7 @@ class OddsService:
             commence = datetime.fromisoformat(
                 event["commence_time"].replace("Z", "+00:00")
             )
-            if game_date and commence.date() != game_date:
+            if game_date and commence.astimezone().date() != game_date:
                 continue
             games.append(
                 Game(
@@ -192,6 +192,39 @@ class OddsService:
         await self.cache.set(cache_key, [p.model_dump() for p in props], PROPS)
         return props
 
+    async def get_historical_event_odds(
+        self,
+        event_id: str,
+        date: str,
+        markets: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """Fetch historical odds snapshot for an event at the given ISO timestamp."""
+        markets_key = ",".join(markets) if markets else "all"
+        cache_key = f"hist_odds:{event_id}:{date}:{markets_key}"
+        cached = await self.cache.get(cache_key)
+        if cached:
+            return cached
+
+        params: dict[str, Any] = {
+            "regions": "us",
+            "oddsFormat": "american",
+            "date": date,
+        }
+        if markets:
+            params["markets"] = ",".join(markets)
+
+        try:
+            data = await self._get(
+                f"/historical/sports/basketball_nba/events/{event_id}/odds",
+                params=params,
+            )
+        except Exception as exc:
+            logger.warning("Historical odds fetch failed for %s at %s: %s", event_id, date, exc)
+            return {}
+
+        await self.cache.set(cache_key, data, HISTORICAL)
+        return data
+
     async def compare_books(self, event_id: str, market: str) -> dict[str, Any]:
         lines = await self.get_odds(event_id, markets=[market])
         result: dict[str, Any] = {}
@@ -215,8 +248,6 @@ class OddsService:
         return result
 
     async def get_line_movement(self, event_id: str) -> LineMovement:
-        # The Odds API doesn't provide historical snapshots on the free tier;
-        # we store two snapshots in cache and compare them to compute movement.
         cache_key = f"line_movement:{event_id}"
         cached = await self.cache.get(cache_key)
         if cached:
@@ -234,32 +265,42 @@ class OddsService:
                 direction="Flat",
             )
 
-        # Use first bookmaker as reference
         ref = lines[0]
-        current_point = ref.spread.point if ref.spread else 0.0
+        current_point = ref.spread.point
 
-        snapshot_key = f"line_snapshot:{event_id}"
-        snapshot = await self.cache.get(snapshot_key)
-        if snapshot is None:
-            await self.cache.set(
-                snapshot_key, {"point": current_point}, ttl_seconds=86400
-            )
-            opening = current_point
-        else:
-            opening = snapshot["point"]
+        # Compute opening timestamp: 48 hours before tip-off
+        opening_ts = (ref.commence_time - timedelta(hours=48)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
 
-        delta = current_point - opening
+        opening_point = current_point  # fallback
+        hist = await self.get_historical_event_odds(event_id, opening_ts, markets=["spreads"])
+        hist_data = hist.get("data") or {}
+        for bookmaker in hist_data.get("bookmakers", []):
+            for market in bookmaker.get("markets", []):
+                if market.get("key") == "spreads":
+                    for outcome in market.get("outcomes", []):
+                        if "point" in outcome:
+                            opening_point = float(outcome["point"])
+                            break
+                    break
+            break
+
+        delta = current_point - opening_point
         direction = "Up" if delta > 0 else ("Down" if delta < 0 else "Flat")
 
         movement = LineMovement(
             event_id=event_id,
             market="spreads",
             bookmaker=ref.bookmaker,
-            opening_line=opening,
+            opening_line=opening_point,
             current_line=current_point,
             delta=delta,
             direction=direction,
-            snapshots=[{"point": opening}, {"point": current_point}],
+            snapshots=[
+                {"timestamp": opening_ts, "point": opening_point},
+                {"timestamp": "current", "point": current_point},
+            ],
         )
         await self.cache.set(cache_key, movement.model_dump(), ODDS)
         return movement

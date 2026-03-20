@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     odds_api_base_url: str = "https://api.the-odds-api.com/v4"
 
     # SportsRadar base URL
-    sportsradar_base_url: str = "https://api.sportradar.com/nba/trial/v8/en"
+    sportsradar_base_url: str = "https://api.sportradar.com/nba/trial/v5/en"
 
     # OpenWeatherMap base URL
     openweather_base_url: str = "https://api.openweathermap.org/data/2.5"
