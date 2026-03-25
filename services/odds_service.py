@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 import httpx
 
-from cache.ttl_cache import RedisCache, HISTORICAL, ODDS, PROPS
+from cache.ttl_cache import RedisCache, ODDS, PROPS  # HISTORICAL unused (disabled)
 from config import settings
 from models.schemas import (
     Game,
@@ -198,32 +198,36 @@ class OddsService:
         date: str,
         markets: Optional[list[str]] = None,
     ) -> dict[str, Any]:
-        """Fetch historical odds snapshot for an event at the given ISO timestamp."""
-        markets_key = ",".join(markets) if markets else "all"
-        cache_key = f"hist_odds:{event_id}:{date}:{markets_key}"
-        cached = await self.cache.get(cache_key)
-        if cached:
-            return cached
+        """Fetch historical odds snapshot for an event at the given ISO timestamp.
+        NOTE: Disabled — the historical endpoint returns EVENT_NOT_FOUND for concluded
+        games and confuses the assistant. Returns empty dict immediately.
+        """
+        # markets_key = ",".join(markets) if markets else "all"
+        # cache_key = f"hist_odds:{event_id}:{date}:{markets_key}"
+        # cached = await self.cache.get(cache_key)
+        # if cached:
+        #     return cached
 
-        params: dict[str, Any] = {
-            "regions": "us",
-            "oddsFormat": "american",
-            "date": date,
-        }
-        if markets:
-            params["markets"] = ",".join(markets)
+        # params: dict[str, Any] = {
+        #     "regions": "us",
+        #     "oddsFormat": "american",
+        #     "date": date,
+        # }
+        # if markets:
+        #     params["markets"] = ",".join(markets)
 
-        try:
-            data = await self._get(
-                f"/historical/sports/basketball_nba/events/{event_id}/odds",
-                params=params,
-            )
-        except Exception as exc:
-            logger.warning("Historical odds fetch failed for %s at %s: %s", event_id, date, exc)
-            return {}
+        # try:
+        #     data = await self._get(
+        #         f"/historical/sports/basketball_nba/events/{event_id}/odds",
+        #         params=params,
+        #     )
+        # except Exception as exc:
+        #     logger.warning("Historical odds fetch failed for %s at %s: %s", event_id, date, exc)
+        #     return {}
 
-        await self.cache.set(cache_key, data, HISTORICAL)
-        return data
+        # await self.cache.set(cache_key, data, HISTORICAL)
+        # return data
+        return {}
 
     async def compare_books(self, event_id: str, market: str) -> dict[str, Any]:
         lines = await self.get_odds(event_id, markets=[market])
@@ -273,18 +277,18 @@ class OddsService:
             "%Y-%m-%dT%H:%M:%SZ"
         )
 
-        opening_point = current_point  # fallback
-        hist = await self.get_historical_event_odds(event_id, opening_ts, markets=["spreads"])
-        hist_data = hist.get("data") or {}
-        for bookmaker in hist_data.get("bookmakers", []):
-            for market in bookmaker.get("markets", []):
-                if market.get("key") == "spreads":
-                    for outcome in market.get("outcomes", []):
-                        if "point" in outcome:
-                            opening_point = float(outcome["point"])
-                            break
-                    break
-            break
+        opening_point = current_point  # fallback (historical lookup disabled)
+        # hist = await self.get_historical_event_odds(event_id, opening_ts, markets=["spreads"])
+        # hist_data = hist.get("data") or {}
+        # for bookmaker in hist_data.get("bookmakers", []):
+        #     for market in bookmaker.get("markets", []):
+        #         if market.get("key") == "spreads":
+        #             for outcome in market.get("outcomes", []):
+        #                 if "point" in outcome:
+        #                     opening_point = float(outcome["point"])
+        #                     break
+        #             break
+        #     break
 
         delta = current_point - opening_point
         direction = "Up" if delta > 0 else ("Down" if delta < 0 else "Flat")

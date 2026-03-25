@@ -125,6 +125,13 @@ class ValueBet(BaseModel):
     kelly_fraction: float
     confidence: str  # "Low", "Medium", "High"
     line_movement: Optional[str] = None  # e.g. "+1.5 ↑ (agrees)" or None
+    trend: Optional[str] = None  # "heating_up", "cooling_off", "stable"
+    minutes_grade: Optional[str] = None  # "very_consistent", "consistent", "moderate", "volatile"
+    back_to_back: Optional[bool] = None
+    pace_grade: Optional[str] = None  # "fast", "average", "slow"
+    usage_boost: Optional[float] = None
+    opponent_def_rank: Optional[int] = None
+    opponent_def_grade: Optional[str] = None  # "elite", "average", "weak"
 
 
 class LineMovement(BaseModel):

@@ -11,6 +11,7 @@ from mcp.server.fastmcp import FastMCP
 from cache.ttl_cache import RedisCache
 from config import settings
 from services.analysis_service import AnalysisService
+from services.defense_service import DefenseService
 from services.odds_service import OddsService
 from services.stats_service import StatsService
 
@@ -38,7 +39,8 @@ mcp = FastMCP(
 cache = RedisCache(settings.redis_url)
 odds_service = OddsService(cache)
 stats_service = StatsService(cache)
-analysis_service = AnalysisService(odds_service, stats_service)
+defense_service = DefenseService(cache)
+analysis_service = AnalysisService(odds_service, stats_service, defense_service)
 
 # ---------------------------------------------------------------------------
 # Register tools

@@ -20,14 +20,25 @@ def register(mcp: FastMCP, cache: RedisCache, odds_service: OddsService) -> None
     _odds_service = odds_service
 
     @mcp.tool()
-    async def get_tonight_games() -> str:
-        """Return tonight's NBA games with tip-off times."""
-        today = date.today()
-        games = await _odds_service.get_games(game_date=today)
-        if not games:
-            return "No NBA games found for tonight."
+    async def get_tonight_games(game_date: str = "") -> str:
+        """Return NBA games with tip-off times for a given date.
 
-        lines = ["**Tonight's NBA Games**\n"]
+        Args:
+            game_date: Date in YYYY-MM-DD format. Defaults to today.
+        """
+        if game_date:
+            try:
+                parsed_date = date.fromisoformat(game_date)
+            except ValueError:
+                return f"Invalid date format: '{game_date}'. Use YYYY-MM-DD."
+        else:
+            parsed_date = datetime.now(tz=timezone.utc).date()
+
+        games = await _odds_service.get_games(game_date=parsed_date)
+        if not games:
+            return f"No NBA games found for {parsed_date}."
+
+        lines = [f"**NBA Games — {parsed_date}**\n"]
         for g in games:
             tip = g.commence_time.astimezone().strftime("%I:%M %p %Z")
             lines.append(f"- {g.away_team} @ {g.home_team}  |  {tip}  |  `{g.id}`")

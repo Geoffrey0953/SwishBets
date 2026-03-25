@@ -79,18 +79,63 @@ def register(
                 f"(using last {last_n_games} games, edge threshold: 3%)."
             )
 
+        def _trend_display(trend: str | None) -> str:
+            if trend == "heating_up":
+                return "🔥 heating"
+            if trend == "cooling_off":
+                return "⚠️ cooling"
+            if trend == "stable":
+                return "✅ stable"
+            return "—"
+
+        def _def_rank_display(rank: int | None, grade: str | None) -> str:
+            if rank is None:
+                return "—"
+            abbrev = {"elite": "elite", "average": "avg", "weak": "weak"}.get(grade or "", "")
+            return f"#{rank} {abbrev}"
+
         rows = [
             f"**Value Props — `{game_id}` (last {last_n_games} games)**\n",
-            "| Selection | Book | Odds | Implied% | True% | Edge | Kelly | Confidence | Line Mvmt |",
-            "|-----------|------|------|----------|-------|------|-------|------------|-----------|",
+            "| Selection | Book | Odds | Implied% | True% | Edge | Kelly | Confidence | Line Mvmt | Trend | Min Grade | B2B | Def Rank |",
+            "|-----------|------|------|----------|-------|------|-------|------------|-----------|-------|-----------|-----|----------|",
         ]
         for b in bets:
+            b2b_flag = "🏃 B2B" if b.back_to_back else "—"
             rows.append(
                 f"| {b.selection} | {b.bookmaker} | {b.american_odds:+d} | "
                 f"{b.implied_probability:.1%} | {b.true_probability:.1%} | "
                 f"{b.edge:.1%} | {b.kelly_fraction:.1%} | {b.confidence} | "
-                f"{b.line_movement or '—'} |"
+                f"{b.line_movement or '—'} | {_trend_display(b.trend)} | "
+                f"{b.minutes_grade or '—'} | {b2b_flag} | "
+                f"{_def_rank_display(b.opponent_def_rank, b.opponent_def_grade)} |"
             )
+
+        # Top Picks summary (top 3 by edge)
+        top_picks = bets[:3]
+        rows.append("\n## Top Picks")
+        for i, b in enumerate(top_picks, 1):
+            signals: list[str] = []
+            if b.trend == "heating_up":
+                signals.append("🔥 heating trend")
+            elif b.trend == "cooling_off":
+                signals.append("⚠️ cooling trend")
+            if b.minutes_grade in ("very_consistent", "consistent"):
+                signals.append(f"{b.minutes_grade.replace('_', ' ')} minutes")
+            if b.back_to_back:
+                signals.append("B2B fatigue")
+            if b.opponent_def_grade == "weak":
+                signals.append(f"weak #{b.opponent_def_rank} defense")
+            elif b.opponent_def_grade == "elite":
+                signals.append(f"elite #{b.opponent_def_rank} defense")
+            if b.pace_grade == "fast":
+                signals.append("fast-paced matchup")
+            if b.usage_boost and b.usage_boost > 0:
+                signals.append("usage boost from injuries")
+            if b.line_movement and "agrees" in b.line_movement:
+                signals.append("line movement confirms")
+            rationale = ", ".join(signals) if signals else "base statistical edge"
+            rows.append(f"{i}. **{b.selection}** ({b.edge:.1%} edge) — {rationale}")
+
         return "\n".join(rows)
 
     @mcp.tool()

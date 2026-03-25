@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 import httpx
 
+from cache.ttl_cache import STATS
 from config import settings
 from models.schemas import ValueBet
 from services.odds_service import OddsService
@@ -19,9 +20,15 @@ EDGE_THRESHOLD = 0.03  # 3% minimum edge to flag a value bet
 
 
 class AnalysisService:
-    def __init__(self, odds_service: OddsService, stats_service: StatsService) -> None:
+    def __init__(
+        self,
+        odds_service: OddsService,
+        stats_service: StatsService,
+        defense_service: Optional[Any] = None,
+    ) -> None:
         self.odds = odds_service
         self.stats = stats_service
+        self.defense_service = defense_service
 
     # ------------------------------------------------------------------
     # Math helpers
@@ -78,7 +85,6 @@ class AnalysisService:
                 logger.warning("Could not fetch odds for %s: %s", game.id, exc)
                 continue
 
-            # Collect best (lowest vig) line per team across all books
             home_odds_list: list[int] = []
             away_odds_list: list[int] = []
             best_bookmaker = "consensus"
@@ -92,15 +98,12 @@ class AnalysisService:
             if not home_odds_list or not away_odds_list:
                 continue
 
-            # Use the most favorable (highest payout) line available
             best_home = max(home_odds_list, key=lambda x: self.american_to_decimal(x))
             best_away = max(away_odds_list, key=lambda x: self.american_to_decimal(x))
 
             implied_home = self.implied_probability(best_home)
             implied_away = self.implied_probability(best_away)
 
-            # Baseline: team win-rate from last 10 games
-            # We use win_pct as a rough true probability
             home_team_data = self.stats.find_team_by_name(game.home_team)
             away_team_data = self.stats.find_team_by_name(game.away_team)
 
@@ -108,17 +111,12 @@ class AnalysisService:
                 continue
 
             try:
-                home_stats = await self.stats.get_team_stats(
-                    home_team_data["id"], last_n=10
-                )
-                away_stats = await self.stats.get_team_stats(
-                    away_team_data["id"], last_n=10
-                )
+                home_stats = await self.stats.get_team_stats(home_team_data["id"], last_n=10)
+                away_stats = await self.stats.get_team_stats(away_team_data["id"], last_n=10)
             except Exception as exc:
                 logger.warning("Could not fetch stats for game %s: %s", game.id, exc)
                 continue
 
-            # Simple Pythagorean-style normalisation
             home_true = home_stats.win_pct
             away_true = away_stats.win_pct
             total = home_true + away_true
@@ -126,7 +124,6 @@ class AnalysisService:
                 home_true = home_true / total
                 away_true = away_true / total
 
-            # Home-court adjustment (+3%)
             home_true = min(home_true + 0.03, 0.99)
             away_true = max(away_true - 0.03, 0.01)
 
@@ -168,18 +165,80 @@ class AnalysisService:
         if not props:
             return []
 
-        # Determine commence_time from the first prop's event odds
+        # Resolve game info: commence_time, home/away teams
         commence_time: Optional[datetime] = None
+        game_date: Optional[date] = None
+        game_home_team: Optional[str] = None
+        game_away_team: Optional[str] = None
         try:
             lines = await self.odds.get_odds(event_id, markets=["h2h"])
             if lines:
                 commence_time = lines[0].commence_time
+                game_date = commence_time.date()
+                game_home_team = lines[0].home_team
+                game_away_team = lines[0].away_team
         except Exception:
             pass
 
-        # Fetch opening prop lines for all markets at once
-        markets_needed = list({p.market for p in props})
-        opening_lines = await self._get_opening_prop_lines(event_id, commence_time, markets_needed)
+        # Resolve team IDs and fetch team stats for pace + b2b
+        home_team_id: Optional[int] = None
+        away_team_id: Optional[int] = None
+        home_team_stats = None
+        away_team_stats = None
+
+        for team_name, setter in [(game_home_team, "home"), (game_away_team, "away")]:
+            if not team_name:
+                continue
+            try:
+                team_data = self.stats.find_team_by_name(team_name)
+                if team_data:
+                    tid = team_data["id"]
+                    tstats = await self.stats.get_team_stats(tid, last_n=10)
+                    if setter == "home":
+                        home_team_id = tid
+                        home_team_stats = tstats
+                    else:
+                        away_team_id = tid
+                        away_team_stats = tstats
+            except Exception as exc:
+                logger.warning("Could not resolve team %s for event %s: %s", team_name, event_id, exc)
+
+        # Compute combined pace grade for this matchup (used per-prop)
+        combined_pace: Optional[float] = None
+        game_pace_grade: Optional[str] = None
+        if (
+            home_team_stats and away_team_stats
+            and home_team_stats.pace is not None
+            and away_team_stats.pace is not None
+        ):
+            combined_pace = (home_team_stats.pace + away_team_stats.pace) / 2
+            if combined_pace >= 100:
+                game_pace_grade = "fast"
+            elif combined_pace >= 97:
+                game_pace_grade = "average"
+            else:
+                game_pace_grade = "slow"
+
+        # Fetch injury reports for usage adjustment
+        home_injuries: list = []
+        away_injuries: list = []
+        if home_team_id:
+            try:
+                home_report = await self.stats.get_injury_report(home_team_id)
+                home_injuries = home_report.players
+            except Exception:
+                pass
+        if away_team_id:
+            try:
+                away_report = await self.stats.get_injury_report(away_team_id)
+                away_injuries = away_report.players
+            except Exception:
+                pass
+
+        # Fetch opening prop lines for line-movement signal (disabled — historical API unreliable)
+        # markets_needed = list({p.market for p in props})
+        # opening_lines = await self._get_opening_prop_lines(event_id, commence_time, markets_needed)
+        opening_lines: dict = {}
 
         value_bets: list[ValueBet] = []
 
@@ -192,6 +251,19 @@ class AnalysisService:
                 game_logs = await self.stats.get_player_stats(player_data["id"])
                 if not game_logs:
                     continue
+
+                # Determine player's team from most recent game log
+                player_team_id: Optional[int] = None
+                opponent_team_id: Optional[int] = None
+                player_team_abbrev = game_logs[0].get("TEAM_ABBREVIATION") if game_logs else None
+                if player_team_abbrev:
+                    pt_data = self.stats.find_team_by_name(player_team_abbrev)
+                    if pt_data:
+                        player_team_id = pt_data["id"]
+                        if player_team_id == home_team_id:
+                            opponent_team_id = away_team_id
+                        elif player_team_id == away_team_id:
+                            opponent_team_id = home_team_id
 
                 stat_col = self._prop_market_to_stat_col(prop.market)
                 if stat_col is None:
@@ -208,30 +280,89 @@ class AnalysisService:
                 mean = statistics.mean(values)
                 stdev = statistics.stdev(values) if len(values) > 1 else 1.0
 
-                # Z-score of prop line relative to historical distribution
                 z = (mean - prop.line) / max(stdev, 0.5)
-
-                # Convert z-score to probability using normal CDF approximation
                 true_over_prob = self._normal_cdf(z)
                 true_under_prob = 1.0 - true_over_prob
 
                 implied_over = self.implied_probability(prop.over_price)
                 implied_under = self.implied_probability(prop.under_price)
 
-                # Opening line for this player+market (for line movement signal)
+                # Opening line for line-movement signal
                 opening_line = opening_lines.get(prop.player_name, {}).get(prop.market)
 
+                # --- Trend detection (last3 vs last10) ---
+                trend: Optional[str] = None
+                values_last3 = values[:3]
+                values_last10 = values[:10]
+                if len(values_last3) >= 3 and len(values_last10) >= 5:
+                    mean3 = statistics.mean(values_last3)
+                    mean10 = statistics.mean(values_last10)
+                    z3 = (mean3 - prop.line) / max(stdev, 0.5)
+                    z10 = (mean10 - prop.line) / max(stdev, 0.5)
+                    trend_delta = self._normal_cdf(z3) - self._normal_cdf(z10)
+                    if trend_delta > 0.20:
+                        trend = "heating_up"
+                    elif trend_delta < -0.20:
+                        trend = "cooling_off"
+                    else:
+                        trend = "stable"
+
+                # --- Minutes consistency ---
+                minutes_grade: Optional[str] = None
+                try:
+                    minutes_data = await self.stats.get_player_minutes_consistency(
+                        player_data["id"], last_n=last_n
+                    )
+                    minutes_grade = minutes_data.get("grade")
+                except Exception:
+                    pass
+
+                # --- Back-to-back ---
+                is_b2b = False
+                if player_team_id and game_date:
+                    try:
+                        is_b2b = await self.stats.is_team_on_back_to_back(player_team_id, game_date)
+                    except Exception:
+                        pass
+
+                # --- Usage adjustment ---
+                player_injuries = (
+                    home_injuries if player_team_id == home_team_id else away_injuries
+                )
+                out_players = [
+                    p.player_name
+                    for p in player_injuries
+                    if p.status in ("Out", "Out For Season")
+                ]
+                usage_adj = await self._calculate_usage_adjustment(
+                    player_data["id"], player_team_id, out_players
+                )
+
+                # --- Opponent defensive rank ---
+                opp_def_rank: Optional[int] = None
+                opp_def_grade: Optional[str] = None
+                if opponent_team_id and self.defense_service:
+                    try:
+                        opp_def_result = await self.defense_service.get_opponent_def_rank(
+                            opponent_team_id, stat_col
+                        )
+                        opp_def_rank = opp_def_result.get("rank")
+                        opp_def_grade = opp_def_result.get("grade")
+                    except Exception:
+                        pass
+
+                # --- Build ValueBet for Over and Under ---
                 for direction, true_prob, implied_prob, american_odds in [
                     ("Over", true_over_prob, implied_over, prop.over_price),
                     ("Under", true_under_prob, implied_under, prop.under_price),
                 ]:
                     edge = self.calculate_edge(true_prob, implied_prob)
 
+                    # Line movement adjustment (existing)
                     line_movement_label: Optional[str] = None
                     if opening_line is not None:
                         line_delta = prop.line - opening_line
                         if abs(line_delta) >= 0.25:
-                            # Agrees: line moved up + Over, or moved down + Under
                             agrees = (line_delta > 0 and direction == "Over") or (
                                 line_delta < 0 and direction == "Under"
                             )
@@ -243,6 +374,45 @@ class AnalysisService:
                                 edge -= 0.010
                                 arrow = "↑" if line_delta > 0 else "↓"
                                 line_movement_label = f"{line_delta:+.1f} {arrow} (disagrees)"
+
+                    # Trend adjustment
+                    if trend == "heating_up":
+                        edge += 0.02 if direction == "Over" else -0.01
+                    elif trend == "cooling_off":
+                        edge += -0.02 if direction == "Over" else 0.01
+
+                    # Minutes consistency adjustment
+                    if minutes_grade == "very_consistent":
+                        edge += 0.015
+                    elif minutes_grade == "consistent":
+                        edge += 0.005
+                    elif minutes_grade == "volatile":
+                        edge -= 0.015
+
+                    # Back-to-back fatigue adjustment
+                    if is_b2b:
+                        if prop.market in ("player_points", "player_assists"):
+                            edge -= 0.01
+                        elif prop.market in ("player_rebounds", "player_threes"):
+                            edge -= 0.005
+
+                    # Pace-of-play adjustment (points and assists only)
+                    if combined_pace is not None and prop.market in (
+                        "player_points", "player_assists"
+                    ):
+                        if combined_pace >= 100:
+                            edge += 0.008
+                        elif combined_pace < 97:
+                            edge -= 0.008
+
+                    # Usage adjustment
+                    edge += usage_adj
+
+                    # Opponent defensive rank adjustment
+                    if opp_def_grade == "weak":
+                        edge += 0.010
+                    elif opp_def_grade == "elite":
+                        edge -= 0.010
 
                     if edge >= EDGE_THRESHOLD:
                         decimal = self.american_to_decimal(american_odds)
@@ -260,6 +430,13 @@ class AnalysisService:
                                 kelly_fraction=self.kelly_criterion(edge, decimal),
                                 confidence=self._confidence(edge),
                                 line_movement=line_movement_label,
+                                trend=trend,
+                                minutes_grade=minutes_grade,
+                                back_to_back=is_b2b if is_b2b else None,
+                                pace_grade=game_pace_grade,
+                                usage_boost=round(usage_adj, 4) if usage_adj != 0.0 else None,
+                                opponent_def_rank=opp_def_rank,
+                                opponent_def_grade=opp_def_grade,
                             )
                         )
             except Exception as exc:
@@ -309,39 +486,111 @@ class AnalysisService:
     # Private helpers
     # ------------------------------------------------------------------
 
+    async def _calculate_usage_adjustment(
+        self,
+        player_id: int,
+        team_id: Optional[int],
+        injured_players: list[str],
+    ) -> float:
+        """Returns an edge delta based on usage absorbed from injured teammates."""
+        if not injured_players or team_id is None:
+            return 0.0
+
+        try:
+            cache_key = f"league_player_stats:{settings.nba_season}"
+            player_stats_data = await self.stats.cache.get(cache_key)
+            if not player_stats_data:
+                print("[API CALL]   nba_api → LeagueDashPlayerStats (Advanced, PerGame)")
+                from nba_api.stats.endpoints import leaguedashplayerstats
+
+                result = leaguedashplayerstats.LeagueDashPlayerStats(
+                    season=settings.nba_season,
+                    measure_type_detailed_defense="Advanced",
+                    per_mode_detailed="PerGame",
+                )
+                df = result.league_dash_player_stats.get_data_frame()
+                player_stats_data = df.to_dict(orient="records")
+                await self.stats.cache.set(cache_key, player_stats_data, STATS)
+
+            # Filter to team members
+            team_players = [p for p in player_stats_data if p.get("TEAM_ID") == team_id]
+            player_row = next(
+                (p for p in player_stats_data if p.get("PLAYER_ID") == player_id), None
+            )
+
+            if not player_row or "USG_PCT" not in (player_row or {}):
+                return 0.0
+
+            player_usg = float(player_row["USG_PCT"] or 0)
+
+            injured_lower = {n.lower() for n in injured_players}
+            active_teammates = [
+                p for p in team_players
+                if p.get("PLAYER_ID") != player_id
+                and (p.get("PLAYER_NAME") or "").lower() not in injured_lower
+            ]
+            out_team_players = [
+                p for p in team_players
+                if (p.get("PLAYER_NAME") or "").lower() in injured_lower
+            ]
+
+            total_out_usg = sum(float(p.get("USG_PCT") or 0) for p in out_team_players)
+            if total_out_usg == 0:
+                return 0.0
+
+            active_usg_total = sum(float(p.get("USG_PCT") or 0) for p in active_teammates)
+            if active_usg_total == 0:
+                return 0.0
+
+            player_share = player_usg / active_usg_total
+            usage_boost = player_share * total_out_usg
+
+            if usage_boost < -0.05:
+                return -0.012
+            if usage_boost > 0.05:
+                return 0.012
+            return 0.0
+
+        except Exception as exc:
+            logger.warning("_calculate_usage_adjustment failed: %s", exc)
+            return 0.0
+
     async def _get_opening_prop_lines(
         self,
         event_id: str,
         commence_time: Optional[datetime],
         markets: list[str],
     ) -> dict[str, dict[str, float]]:
-        """Return {player_name: {market: opening_line}} from 48h-before snapshot."""
-        if commence_time is None or not markets:
-            return {}
+        """Return {player_name: {market: opening_line}} from 48h-before snapshot.
+        NOTE: Disabled — historical API returns EVENT_NOT_FOUND for concluded games.
+        """
+        return {}
 
-        opening_ts = (commence_time - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        try:
-            hist = await self.odds.get_historical_event_odds(event_id, opening_ts, markets=markets)
-        except Exception as exc:
-            logger.debug("Could not fetch opening prop lines: %s", exc)
-            return {}
+        # if commence_time is None or not markets:
+        #     return {}
 
-        hist_data = hist.get("data") or {}
-        result: dict[str, dict[str, float]] = {}
+        # opening_ts = (commence_time - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # try:
+        #     hist = await self.odds.get_historical_event_odds(event_id, opening_ts, markets=markets)
+        # except Exception as exc:
+        #     logger.debug("Could not fetch opening prop lines: %s", exc)
+        #     return {}
 
-        for bookmaker in hist_data.get("bookmakers", []):
-            for market in bookmaker.get("markets", []):
-                market_key = market.get("key", "")
-                for outcome in market.get("outcomes", []):
-                    player_name = outcome.get("description", outcome.get("name", ""))
-                    if not player_name or "point" not in outcome:
-                        continue
-                    result.setdefault(player_name, {})
-                    # Only set if not already seen (first bookmaker wins)
-                    if market_key not in result[player_name]:
-                        result[player_name][market_key] = float(outcome["point"])
+        # hist_data = hist.get("data") or {}
+        # result: dict[str, dict[str, float]] = {}
 
-        return result
+        # for bookmaker in hist_data.get("bookmakers", []):
+        #     for market in bookmaker.get("markets", []):
+        #         market_key = market.get("key", "")
+        #         for outcome in market.get("outcomes", []):
+        #             player_name = outcome.get("description", outcome.get("name", ""))
+        #             if not player_name or "point" not in outcome:
+        #                 continue
+        #             result.setdefault(player_name, {})
+        #             if market_key not in result[player_name]:
+        #                 result[player_name][market_key] = float(outcome["point"])
+
+        # return result
 
     async def _find_player(self, name: str) -> Optional[dict[str, Any]]:
         try:
