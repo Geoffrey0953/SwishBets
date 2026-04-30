@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -25,9 +25,12 @@ class Player(BaseModel):
 
 
 class Spread(BaseModel):
-    team: str
-    point: float
-    price: int  # American odds
+    home_team: str
+    home_point: float
+    home_price: int
+    away_team: str
+    away_point: float
+    away_price: int
 
 
 class Total(BaseModel):
@@ -81,7 +84,7 @@ class InjuryReport(BaseModel):
     team_id: int
     team_name: str
     players: list[InjuryPlayer] = Field(default_factory=list)
-    retrieved_at: datetime = Field(default_factory=datetime.utcnow)
+    retrieved_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class TeamStats(BaseModel):
@@ -132,6 +135,22 @@ class ValueBet(BaseModel):
     usage_boost: Optional[float] = None
     opponent_def_rank: Optional[int] = None
     opponent_def_grade: Optional[str] = None  # "elite", "average", "weak"
+
+
+class ArbOpportunity(BaseModel):
+    event_id: str
+    market: str           # "h2h", "spreads", "totals", "player_points", etc.
+    home_team: str
+    away_team: str
+    side_a: str           # e.g. "Detroit Pistons" or "Over 211.5"
+    side_a_book: str
+    side_a_odds: int
+    side_b: str           # e.g. "Orlando Magic" or "Under 211.5"
+    side_b_book: str
+    side_b_odds: int
+    arb_pct: float        # guaranteed profit % per $100 total staked
+    side_a_stake: float   # optimal stake on side A per $100 total
+    side_b_stake: float   # optimal stake on side B per $100 total
 
 
 class LineMovement(BaseModel):

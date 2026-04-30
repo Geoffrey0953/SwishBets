@@ -32,7 +32,7 @@ def register(mcp: FastMCP, cache: RedisCache, odds_service: OddsService) -> None
             except ValueError:
                 return f"Invalid date format: '{game_date}'. Use YYYY-MM-DD."
         else:
-            parsed_date = datetime.now(tz=timezone.utc).date()
+            parsed_date = date.today()
 
         games = await _odds_service.get_games(game_date=parsed_date)
         if not games:
@@ -65,8 +65,10 @@ def register(mcp: FastMCP, cache: RedisCache, odds_service: OddsService) -> None
                 )
             if line.spread:
                 out.append(
-                    f"  Spread: {line.spread.team} {line.spread.point:+.1f} "
-                    f"({line.spread.price:+d})"
+                    f"  Spread: {line.spread.home_team} {line.spread.home_point:+.1f} "
+                    f"({line.spread.home_price:+d}) | "
+                    f"{line.spread.away_team} {line.spread.away_point:+.1f} "
+                    f"({line.spread.away_price:+d})"
                 )
             if line.total:
                 out.append(
@@ -118,6 +120,58 @@ def register(mcp: FastMCP, cache: RedisCache, odds_service: OddsService) -> None
 
         out = [f"**{market.upper()} comparison for `{game_id}`**\n"]
         out.append(f"```\n{json.dumps(comparison, indent=2)}\n```")
+        return "\n".join(out)
+
+    @mcp.tool()
+    async def get_pinnacle_line(game_id: str) -> str:
+        """Get Pinnacle's sharp line and no-vig fair odds probabilities for a game.
+
+        Args:
+            game_id: The game ID returned by get_tonight_games.
+        """
+        try:
+            line = await _odds_service.get_pinnacle_odds(game_id)
+        except ValueError as exc:
+            return f"Could not fetch Pinnacle line for `{game_id}`: {exc}"
+
+        if not line:
+            return f"Pinnacle line not available for `{game_id}`."
+
+        from services.analysis_service import AnalysisService
+        from cache.ttl_cache import RedisCache
+        from services.stats_service import StatsService
+
+        # Use inline no-vig calc to avoid importing the full service
+        def _imp(price: int) -> float:
+            if price > 0:
+                return 100 / (price + 100)
+            return abs(price) / (abs(price) + 100)
+
+        out = [f"**Pinnacle Sharp Line — `{game_id}`**\n"]
+        out.append(f"{line.away_team} @ {line.home_team}\n")
+
+        if line.moneyline_home is not None and line.moneyline_away is not None:
+            imp_h = _imp(line.moneyline_home)
+            imp_a = _imp(line.moneyline_away)
+            total = imp_h + imp_a
+            nv_h = imp_h / total
+            nv_a = imp_a / total
+            out.append("**Moneyline (no-vig fair odds)**")
+            out.append(f"- {line.home_team}: {line.moneyline_home:+d} → {nv_h:.1%} fair probability")
+            out.append(f"- {line.away_team}: {line.moneyline_away:+d} → {nv_a:.1%} fair probability")
+            out.append(f"- Pinnacle vig: {(total - 1) * 100:.2f}%\n")
+
+        if line.spread:
+            out.append(
+                f"**Spread:** {line.spread.home_team} {line.spread.home_point:+.1f} "
+                f"({line.spread.home_price:+d}) | "
+                f"{line.spread.away_team} {line.spread.away_point:+.1f} "
+                f"({line.spread.away_price:+d})\n"
+            )
+
+        if line.total:
+            out.append(f"**Total:** {line.total.point} — Over {line.total.over_price:+d} / Under {line.total.under_price:+d}")
+
         return "\n".join(out)
 
     @mcp.tool()

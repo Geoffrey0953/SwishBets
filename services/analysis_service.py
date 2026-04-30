@@ -10,13 +10,24 @@ import httpx
 
 from cache.ttl_cache import STATS
 from config import settings
-from models.schemas import ValueBet
+from models.schemas import ArbOpportunity, ValueBet
 from services.odds_service import OddsService
 from services.stats_service import StatsService
 
 logger = logging.getLogger(__name__)
 
-EDGE_THRESHOLD = 0.03  # 3% minimum edge to flag a value bet
+EDGE_THRESHOLD = 0.01  # 1% minimum edge to flag a value bet
+
+# Prop odds filters: hard cutoff = data error (skip), soft = suspicious (flag with ⚠)
+_MAX_PROP_ODDS = 1000   # skip entirely — no legitimate prop line is ever > +1000
+_WARN_PROP_ODDS = 500   # flag with ⚠ — unusual but possible for deep longshots
+
+# Books that share the same operator — arbing between them is impossible
+_BOOK_GROUP: dict[str, str] = {
+    "hardrockbet_fl": "hardrockbet",
+    "hardrockbet_az": "hardrockbet",
+    "lowvig": "betonlineag",
+}
 
 
 class AnalysisService:
@@ -46,6 +57,13 @@ class AnalysisService:
             return (american_odds / 100) + 1.0
         return (100 / abs(american_odds)) + 1.0
 
+    def no_vig_prob(self, price_a: int, price_b: int) -> tuple[float, float]:
+        """Strip vig from a two-sided market. Returns (prob_a, prob_b) summing to 1.0."""
+        imp_a = self.implied_probability(price_a)
+        imp_b = self.implied_probability(price_b)
+        total = imp_a + imp_b
+        return imp_a / total, imp_b / total
+
     def calculate_edge(self, true_prob: float, implied_prob: float) -> float:
         """Edge = true probability minus implied probability."""
         return true_prob - implied_prob
@@ -59,6 +77,10 @@ class AnalysisService:
         kelly = (edge * decimal_odds) / (decimal_odds - 1)
         return round(min(kelly, 0.25), 4)
 
+    def _canonical_book(self, book: str) -> str:
+        """Normalize regional book variants to their parent operator."""
+        return _BOOK_GROUP.get(book, book)
+
     def _confidence(self, edge: float) -> str:
         if edge >= 0.08:
             return "High"
@@ -71,10 +93,8 @@ class AnalysisService:
     # ------------------------------------------------------------------
 
     async def find_value_bets(self, game_date: Optional[date] = None) -> list[ValueBet]:
-        """Scan tonight's games for moneyline value versus team win-rate baseline."""
-        if game_date is None:
-            game_date = date.today()
-
+        """Scan upcoming games for moneyline value using Pinnacle no-vig as true probability."""
+        # Pass game_date only when explicitly provided — None fetches all upcoming games
         games = await self.odds.get_games(game_date=game_date)
         value_bets: list[ValueBet] = []
 
@@ -85,51 +105,61 @@ class AnalysisService:
                 logger.warning("Could not fetch odds for %s: %s", game.id, exc)
                 continue
 
-            home_odds_list: list[int] = []
-            away_odds_list: list[int] = []
-            best_bookmaker = "consensus"
+            home_book_odds: list[tuple[str, int]] = []  # (bookmaker, price)
+            away_book_odds: list[tuple[str, int]] = []
             for line in lines:
                 if line.moneyline_home is not None:
-                    home_odds_list.append(line.moneyline_home)
+                    home_book_odds.append((line.bookmaker, line.moneyline_home))
                 if line.moneyline_away is not None:
-                    away_odds_list.append(line.moneyline_away)
-                best_bookmaker = line.bookmaker
+                    away_book_odds.append((line.bookmaker, line.moneyline_away))
 
-            if not home_odds_list or not away_odds_list:
+            if not home_book_odds or not away_book_odds:
                 continue
 
-            best_home = max(home_odds_list, key=lambda x: self.american_to_decimal(x))
-            best_away = max(away_odds_list, key=lambda x: self.american_to_decimal(x))
+            best_home_book, best_home = max(home_book_odds, key=lambda x: self.american_to_decimal(x[1]))
+            best_away_book, best_away = max(away_book_odds, key=lambda x: self.american_to_decimal(x[1]))
 
             implied_home = self.implied_probability(best_home)
             implied_away = self.implied_probability(best_away)
 
-            home_team_data = self.stats.find_team_by_name(game.home_team)
-            away_team_data = self.stats.find_team_by_name(game.away_team)
-
-            if not home_team_data or not away_team_data:
-                continue
-
+            # --- True probability: Pinnacle no-vig (falls back to team win%) ---
+            home_true: Optional[float] = None
+            away_true: Optional[float] = None
             try:
-                home_stats = await self.stats.get_team_stats(home_team_data["id"], last_n=10)
-                away_stats = await self.stats.get_team_stats(away_team_data["id"], last_n=10)
+                pinnacle_line = await self.odds.get_pinnacle_odds(game.id, markets=["h2h"])
+                if (
+                    pinnacle_line
+                    and pinnacle_line.moneyline_home is not None
+                    and pinnacle_line.moneyline_away is not None
+                ):
+                    home_true, away_true = self.no_vig_prob(
+                        pinnacle_line.moneyline_home, pinnacle_line.moneyline_away
+                    )
             except Exception as exc:
-                logger.warning("Could not fetch stats for game %s: %s", game.id, exc)
-                continue
+                logger.warning("Could not fetch Pinnacle line for %s: %s", game.id, exc)
 
-            home_true = home_stats.win_pct
-            away_true = away_stats.win_pct
-            total = home_true + away_true
-            if total > 0:
-                home_true = home_true / total
-                away_true = away_true / total
+            if home_true is None or away_true is None:
+                # Fallback: normalize team win rates
+                home_team_data = self.stats.find_team_by_name(game.home_team)
+                away_team_data = self.stats.find_team_by_name(game.away_team)
+                if not home_team_data or not away_team_data:
+                    continue
+                try:
+                    home_stats = await self.stats.get_team_stats(home_team_data["id"], last_n=10)
+                    away_stats = await self.stats.get_team_stats(away_team_data["id"], last_n=10)
+                except Exception as exc:
+                    logger.warning("Could not fetch stats for game %s: %s", game.id, exc)
+                    continue
+                total = home_stats.win_pct + away_stats.win_pct
+                if total > 0:
+                    home_true = home_stats.win_pct / total
+                    away_true = away_stats.win_pct / total
+                else:
+                    continue
 
-            home_true = min(home_true + 0.03, 0.99)
-            away_true = max(away_true - 0.03, 0.01)
-
-            for team, true_prob, implied_prob, american_odds in [
-                (game.home_team, home_true, implied_home, best_home),
-                (game.away_team, away_true, implied_away, best_away),
+            for team, true_prob, implied_prob, american_odds, bookmaker in [
+                (game.home_team, home_true, implied_home, best_home, best_home_book),
+                (game.away_team, away_true, implied_away, best_away, best_away_book),
             ]:
                 edge = self.calculate_edge(true_prob, implied_prob)
                 if edge >= EDGE_THRESHOLD:
@@ -139,7 +169,7 @@ class AnalysisService:
                             event_id=game.id,
                             market="h2h",
                             selection=team,
-                            bookmaker=best_bookmaker,
+                            bookmaker=bookmaker,
                             american_odds=american_odds,
                             implied_probability=round(implied_prob, 4),
                             true_probability=round(true_prob, 4),
@@ -148,300 +178,6 @@ class AnalysisService:
                             confidence=self._confidence(edge),
                         )
                     )
-
-        value_bets.sort(key=lambda b: b.edge, reverse=True)
-        return value_bets
-
-    async def find_value_props(
-        self, event_id: str, last_n: int = 10
-    ) -> list[ValueBet]:
-        """For each player prop in a game, compare the line vs player's last-N average."""
-        try:
-            props = await self.odds.get_player_props(event_id)
-        except Exception as exc:
-            logger.warning("Could not fetch props for %s: %s", event_id, exc)
-            return []
-
-        if not props:
-            return []
-
-        # Resolve game info: commence_time, home/away teams
-        commence_time: Optional[datetime] = None
-        game_date: Optional[date] = None
-        game_home_team: Optional[str] = None
-        game_away_team: Optional[str] = None
-        try:
-            lines = await self.odds.get_odds(event_id, markets=["h2h"])
-            if lines:
-                commence_time = lines[0].commence_time
-                game_date = commence_time.date()
-                game_home_team = lines[0].home_team
-                game_away_team = lines[0].away_team
-        except Exception:
-            pass
-
-        # Resolve team IDs and fetch team stats for pace + b2b
-        home_team_id: Optional[int] = None
-        away_team_id: Optional[int] = None
-        home_team_stats = None
-        away_team_stats = None
-
-        for team_name, setter in [(game_home_team, "home"), (game_away_team, "away")]:
-            if not team_name:
-                continue
-            try:
-                team_data = self.stats.find_team_by_name(team_name)
-                if team_data:
-                    tid = team_data["id"]
-                    tstats = await self.stats.get_team_stats(tid, last_n=10)
-                    if setter == "home":
-                        home_team_id = tid
-                        home_team_stats = tstats
-                    else:
-                        away_team_id = tid
-                        away_team_stats = tstats
-            except Exception as exc:
-                logger.warning("Could not resolve team %s for event %s: %s", team_name, event_id, exc)
-
-        # Compute combined pace grade for this matchup (used per-prop)
-        combined_pace: Optional[float] = None
-        game_pace_grade: Optional[str] = None
-        if (
-            home_team_stats and away_team_stats
-            and home_team_stats.pace is not None
-            and away_team_stats.pace is not None
-        ):
-            combined_pace = (home_team_stats.pace + away_team_stats.pace) / 2
-            if combined_pace >= 100:
-                game_pace_grade = "fast"
-            elif combined_pace >= 97:
-                game_pace_grade = "average"
-            else:
-                game_pace_grade = "slow"
-
-        # Fetch injury reports for usage adjustment
-        home_injuries: list = []
-        away_injuries: list = []
-        if home_team_id:
-            try:
-                home_report = await self.stats.get_injury_report(home_team_id)
-                home_injuries = home_report.players
-            except Exception:
-                pass
-        if away_team_id:
-            try:
-                away_report = await self.stats.get_injury_report(away_team_id)
-                away_injuries = away_report.players
-            except Exception:
-                pass
-
-        # Fetch opening prop lines for line-movement signal (disabled — historical API unreliable)
-        # markets_needed = list({p.market for p in props})
-        # opening_lines = await self._get_opening_prop_lines(event_id, commence_time, markets_needed)
-        opening_lines: dict = {}
-
-        value_bets: list[ValueBet] = []
-
-        for prop in props:
-            try:
-                player_data = await self._find_player(prop.player_name)
-                if not player_data:
-                    continue
-
-                game_logs = await self.stats.get_player_stats(player_data["id"])
-                if not game_logs:
-                    continue
-
-                # Determine player's team from most recent game log
-                player_team_id: Optional[int] = None
-                opponent_team_id: Optional[int] = None
-                player_team_abbrev = game_logs[0].get("TEAM_ABBREVIATION") if game_logs else None
-                if player_team_abbrev:
-                    pt_data = self.stats.find_team_by_name(player_team_abbrev)
-                    if pt_data:
-                        player_team_id = pt_data["id"]
-                        if player_team_id == home_team_id:
-                            opponent_team_id = away_team_id
-                        elif player_team_id == away_team_id:
-                            opponent_team_id = home_team_id
-
-                stat_col = self._prop_market_to_stat_col(prop.market)
-                if stat_col is None:
-                    continue
-
-                values = [
-                    float(g[stat_col])
-                    for g in game_logs[:last_n]
-                    if stat_col in g and g[stat_col] is not None
-                ]
-                if len(values) < 3:
-                    continue
-
-                mean = statistics.mean(values)
-                stdev = statistics.stdev(values) if len(values) > 1 else 1.0
-
-                z = (mean - prop.line) / max(stdev, 0.5)
-                true_over_prob = self._normal_cdf(z)
-                true_under_prob = 1.0 - true_over_prob
-
-                implied_over = self.implied_probability(prop.over_price)
-                implied_under = self.implied_probability(prop.under_price)
-
-                # Opening line for line-movement signal
-                opening_line = opening_lines.get(prop.player_name, {}).get(prop.market)
-
-                # --- Trend detection (last3 vs last10) ---
-                trend: Optional[str] = None
-                values_last3 = values[:3]
-                values_last10 = values[:10]
-                if len(values_last3) >= 3 and len(values_last10) >= 5:
-                    mean3 = statistics.mean(values_last3)
-                    mean10 = statistics.mean(values_last10)
-                    z3 = (mean3 - prop.line) / max(stdev, 0.5)
-                    z10 = (mean10 - prop.line) / max(stdev, 0.5)
-                    trend_delta = self._normal_cdf(z3) - self._normal_cdf(z10)
-                    if trend_delta > 0.20:
-                        trend = "heating_up"
-                    elif trend_delta < -0.20:
-                        trend = "cooling_off"
-                    else:
-                        trend = "stable"
-
-                # --- Minutes consistency ---
-                minutes_grade: Optional[str] = None
-                try:
-                    minutes_data = await self.stats.get_player_minutes_consistency(
-                        player_data["id"], last_n=last_n
-                    )
-                    minutes_grade = minutes_data.get("grade")
-                except Exception:
-                    pass
-
-                # --- Back-to-back ---
-                is_b2b = False
-                if player_team_id and game_date:
-                    try:
-                        is_b2b = await self.stats.is_team_on_back_to_back(player_team_id, game_date)
-                    except Exception:
-                        pass
-
-                # --- Usage adjustment ---
-                player_injuries = (
-                    home_injuries if player_team_id == home_team_id else away_injuries
-                )
-                out_players = [
-                    p.player_name
-                    for p in player_injuries
-                    if p.status in ("Out", "Out For Season")
-                ]
-                usage_adj = await self._calculate_usage_adjustment(
-                    player_data["id"], player_team_id, out_players
-                )
-
-                # --- Opponent defensive rank ---
-                opp_def_rank: Optional[int] = None
-                opp_def_grade: Optional[str] = None
-                if opponent_team_id and self.defense_service:
-                    try:
-                        opp_def_result = await self.defense_service.get_opponent_def_rank(
-                            opponent_team_id, stat_col
-                        )
-                        opp_def_rank = opp_def_result.get("rank")
-                        opp_def_grade = opp_def_result.get("grade")
-                    except Exception:
-                        pass
-
-                # --- Build ValueBet for Over and Under ---
-                for direction, true_prob, implied_prob, american_odds in [
-                    ("Over", true_over_prob, implied_over, prop.over_price),
-                    ("Under", true_under_prob, implied_under, prop.under_price),
-                ]:
-                    edge = self.calculate_edge(true_prob, implied_prob)
-
-                    # Line movement adjustment (existing)
-                    line_movement_label: Optional[str] = None
-                    if opening_line is not None:
-                        line_delta = prop.line - opening_line
-                        if abs(line_delta) >= 0.25:
-                            agrees = (line_delta > 0 and direction == "Over") or (
-                                line_delta < 0 and direction == "Under"
-                            )
-                            if agrees:
-                                edge += 0.015
-                                arrow = "↑" if line_delta > 0 else "↓"
-                                line_movement_label = f"{line_delta:+.1f} {arrow} (agrees)"
-                            else:
-                                edge -= 0.010
-                                arrow = "↑" if line_delta > 0 else "↓"
-                                line_movement_label = f"{line_delta:+.1f} {arrow} (disagrees)"
-
-                    # Trend adjustment
-                    if trend == "heating_up":
-                        edge += 0.02 if direction == "Over" else -0.01
-                    elif trend == "cooling_off":
-                        edge += -0.02 if direction == "Over" else 0.01
-
-                    # Minutes consistency adjustment
-                    if minutes_grade == "very_consistent":
-                        edge += 0.015
-                    elif minutes_grade == "consistent":
-                        edge += 0.005
-                    elif minutes_grade == "volatile":
-                        edge -= 0.015
-
-                    # Back-to-back fatigue adjustment
-                    if is_b2b:
-                        if prop.market in ("player_points", "player_assists"):
-                            edge -= 0.01
-                        elif prop.market in ("player_rebounds", "player_threes"):
-                            edge -= 0.005
-
-                    # Pace-of-play adjustment (points and assists only)
-                    if combined_pace is not None and prop.market in (
-                        "player_points", "player_assists"
-                    ):
-                        if combined_pace >= 100:
-                            edge += 0.008
-                        elif combined_pace < 97:
-                            edge -= 0.008
-
-                    # Usage adjustment
-                    edge += usage_adj
-
-                    # Opponent defensive rank adjustment
-                    if opp_def_grade == "weak":
-                        edge += 0.010
-                    elif opp_def_grade == "elite":
-                        edge -= 0.010
-
-                    if edge >= EDGE_THRESHOLD:
-                        decimal = self.american_to_decimal(american_odds)
-                        label = f"{prop.player_name} {direction} {prop.line} {prop.market}"
-                        value_bets.append(
-                            ValueBet(
-                                event_id=event_id,
-                                market=prop.market,
-                                selection=label,
-                                bookmaker=prop.bookmaker,
-                                american_odds=american_odds,
-                                implied_probability=round(implied_prob, 4),
-                                true_probability=round(true_prob, 4),
-                                edge=round(edge, 4),
-                                kelly_fraction=self.kelly_criterion(edge, decimal),
-                                confidence=self._confidence(edge),
-                                line_movement=line_movement_label,
-                                trend=trend,
-                                minutes_grade=minutes_grade,
-                                back_to_back=is_b2b if is_b2b else None,
-                                pace_grade=game_pace_grade,
-                                usage_boost=round(usage_adj, 4) if usage_adj != 0.0 else None,
-                                opponent_def_rank=opp_def_rank,
-                                opponent_def_grade=opp_def_grade,
-                            )
-                        )
-            except Exception as exc:
-                logger.debug("Prop analysis error for %s: %s", prop.player_name, exc)
-                continue
 
         value_bets.sort(key=lambda b: b.edge, reverse=True)
         return value_bets
@@ -481,6 +217,334 @@ class AnalysisService:
         except Exception as exc:
             logger.warning("Weather API error for %s: %s", venue_city, exc)
             return {"city": venue_city, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Arb & Positive EV scanners
+    # ------------------------------------------------------------------
+
+    async def find_arb(self, min_arb_pct: float = 0.001) -> list[ArbOpportunity]:
+        """Scan all upcoming games for arbitrage across all books and markets."""
+        games = await self.odds.get_games()
+        arbs: list[ArbOpportunity] = []
+        for game in games:
+            try:
+                lines = await self.odds.get_odds(game.id)
+                arbs.extend(self._scan_game_lines_for_arb(game, lines, min_arb_pct))
+            except Exception as exc:
+                logger.warning("Arb scan (game lines) failed for %s: %s", game.id, exc)
+            try:
+                props = await self.odds.get_player_props(game.id)
+                arbs.extend(self._scan_props_for_arb(game, props, min_arb_pct))
+            except Exception as exc:
+                logger.warning("Arb scan (props) failed for %s: %s", game.id, exc)
+        arbs.sort(key=lambda a: a.arb_pct, reverse=True)
+        return arbs
+
+    def _scan_game_lines_for_arb(
+        self, game: Any, lines: list, min_arb_pct: float
+    ) -> list[ArbOpportunity]:
+        arbs: list[ArbOpportunity] = []
+
+        # --- h2h ---
+        best_home: dict = {}  # bookmaker -> price
+        best_away: dict = {}
+        for line in lines:
+            if line.moneyline_home is not None:
+                if not best_home or self.american_to_decimal(line.moneyline_home) > self.american_to_decimal(best_home["price"]):
+                    best_home = {"book": line.bookmaker, "price": line.moneyline_home}
+            if line.moneyline_away is not None:
+                if not best_away or self.american_to_decimal(line.moneyline_away) > self.american_to_decimal(best_away["price"]):
+                    best_away = {"book": line.bookmaker, "price": line.moneyline_away}
+        if best_home and best_away and self._canonical_book(best_home["book"]) != self._canonical_book(best_away["book"]):
+            arb = self._calc_arb(best_home["price"], best_away["price"])
+            if arb and arb >= min_arb_pct:
+                da = self.american_to_decimal(best_home["price"])
+                db = self.american_to_decimal(best_away["price"])
+                total_imp = 1/da + 1/db
+                stake_a = round(100 / (da * total_imp), 2)
+                arbs.append(ArbOpportunity(
+                    event_id=game.id, market="h2h",
+                    home_team=game.home_team, away_team=game.away_team,
+                    side_a=game.home_team, side_a_book=best_home["book"], side_a_odds=best_home["price"],
+                    side_b=game.away_team, side_b_book=best_away["book"], side_b_odds=best_away["price"],
+                    arb_pct=round(arb, 4),
+                    side_a_stake=stake_a, side_b_stake=round(100 - stake_a, 2),
+                ))
+
+        # --- spreads (group by both side points — only compare same-line prices) ---
+        from collections import defaultdict
+        spread_by_point: dict[tuple[float, float], list] = defaultdict(list)
+        for line in lines:
+            if line.spread is not None:
+                spread_by_point[
+                    (line.spread.home_point, line.spread.away_point)
+                ].append(line)
+        for (home_point, away_point), grp in spread_by_point.items():
+            best_home_sp: dict = {}
+            best_away_sp: dict = {}
+            for line in grp:
+                if not best_home_sp or self.american_to_decimal(line.spread.home_price) > self.american_to_decimal(best_home_sp["price"]):
+                    best_home_sp = {"book": line.bookmaker, "price": line.spread.home_price}
+                if not best_away_sp or self.american_to_decimal(line.spread.away_price) > self.american_to_decimal(best_away_sp["price"]):
+                    best_away_sp = {"book": line.bookmaker, "price": line.spread.away_price}
+            if best_home_sp and best_away_sp and self._canonical_book(best_home_sp["book"]) != self._canonical_book(best_away_sp["book"]):
+                arb = self._calc_arb(best_home_sp["price"], best_away_sp["price"])
+                if arb and arb >= min_arb_pct:
+                    da = self.american_to_decimal(best_home_sp["price"])
+                    db = self.american_to_decimal(best_away_sp["price"])
+                    total_imp = 1/da + 1/db
+                    stake_a = round(100 / (da * total_imp), 2)
+                    arbs.append(ArbOpportunity(
+                        event_id=game.id, market="spreads",
+                        home_team=game.home_team, away_team=game.away_team,
+                        side_a=f"{game.home_team} {home_point:+.1f}",
+                        side_a_book=best_home_sp["book"], side_a_odds=best_home_sp["price"],
+                        side_b=f"{game.away_team} {away_point:+.1f}",
+                        side_b_book=best_away_sp["book"], side_b_odds=best_away_sp["price"],
+                        arb_pct=round(arb, 4),
+                        side_a_stake=stake_a, side_b_stake=round(100 - stake_a, 2),
+                    ))
+
+        # --- totals (group by total — only compare over/under at the same number) ---
+        totals_by_point: dict[float, list] = defaultdict(list)
+        for line in lines:
+            if line.total is not None:
+                totals_by_point[line.total.point].append(line)
+        for point, grp in totals_by_point.items():
+            best_over: dict = {}
+            best_under: dict = {}
+            for line in grp:
+                if not best_over or self.american_to_decimal(line.total.over_price) > self.american_to_decimal(best_over["price"]):
+                    best_over = {"book": line.bookmaker, "price": line.total.over_price}
+                if not best_under or self.american_to_decimal(line.total.under_price) > self.american_to_decimal(best_under["price"]):
+                    best_under = {"book": line.bookmaker, "price": line.total.under_price}
+            if best_over and best_under and self._canonical_book(best_over["book"]) != self._canonical_book(best_under["book"]):
+                arb = self._calc_arb(best_over["price"], best_under["price"])
+                if arb and arb >= min_arb_pct:
+                    da = self.american_to_decimal(best_over["price"])
+                    db = self.american_to_decimal(best_under["price"])
+                    total_imp = 1/da + 1/db
+                    stake_a = round(100 / (da * total_imp), 2)
+                    arbs.append(ArbOpportunity(
+                        event_id=game.id, market="totals",
+                        home_team=game.home_team, away_team=game.away_team,
+                        side_a=f"Over {point}", side_a_book=best_over["book"], side_a_odds=best_over["price"],
+                        side_b=f"Under {point}", side_b_book=best_under["book"], side_b_odds=best_under["price"],
+                        arb_pct=round(arb, 4),
+                        side_a_stake=stake_a, side_b_stake=round(100 - stake_a, 2),
+                    ))
+        return arbs
+
+    def _scan_props_for_arb(
+        self, game: Any, props: list, min_arb_pct: float
+    ) -> list[ArbOpportunity]:
+        """Group props by (player, market, line), find best over/under across books."""
+        arbs: list[ArbOpportunity] = []
+        # Group by (player_name, market, line)
+        groups: dict[tuple, dict] = {}
+        for p in props:
+            if p.over_price > _MAX_PROP_ODDS or p.under_price > _MAX_PROP_ODDS:
+                continue
+            key = (p.player_name, p.market, p.line)
+            groups.setdefault(key, {"best_over": None, "best_under": None})
+            if groups[key]["best_over"] is None or self.american_to_decimal(p.over_price) > self.american_to_decimal(groups[key]["best_over"]["price"]):
+                groups[key]["best_over"] = {"book": p.bookmaker, "price": p.over_price}
+            if groups[key]["best_under"] is None or self.american_to_decimal(p.under_price) > self.american_to_decimal(groups[key]["best_under"]["price"]):
+                groups[key]["best_under"] = {"book": p.bookmaker, "price": p.under_price}
+
+        for (player, market, line), sides in groups.items():
+            bo = sides["best_over"]
+            bu = sides["best_under"]
+            if not bo or not bu or self._canonical_book(bo["book"]) == self._canonical_book(bu["book"]):
+                continue
+            arb = self._calc_arb(bo["price"], bu["price"])
+            if arb and arb >= min_arb_pct:
+                da = self.american_to_decimal(bo["price"])
+                db = self.american_to_decimal(bu["price"])
+                total_imp = 1/da + 1/db
+                stake_a = round(100 / (da * total_imp), 2)
+                over_flag = " ⚠" if _WARN_PROP_ODDS < bo["price"] <= _MAX_PROP_ODDS else ""
+                under_flag = " ⚠" if _WARN_PROP_ODDS < bu["price"] <= _MAX_PROP_ODDS else ""
+                arbs.append(ArbOpportunity(
+                    event_id=game.id, market=market,
+                    home_team=game.home_team, away_team=game.away_team,
+                    side_a=f"{player} Over {line}{over_flag}", side_a_book=bo["book"], side_a_odds=bo["price"],
+                    side_b=f"{player} Under {line}{under_flag}", side_b_book=bu["book"], side_b_odds=bu["price"],
+                    arb_pct=round(arb, 4),
+                    side_a_stake=stake_a, side_b_stake=round(100 - stake_a, 2),
+                ))
+        return arbs
+
+    def _calc_arb(self, price_a: int, price_b: int) -> Optional[float]:
+        """Returns arb profit % if exists, else None."""
+        da = self.american_to_decimal(price_a)
+        db = self.american_to_decimal(price_b)
+        total_implied = 1/da + 1/db
+        if total_implied < 1.0:
+            return 1.0 - total_implied
+        return None
+
+    async def find_positive_ev(self, min_edge: float = 0.01) -> list[ValueBet]:
+        """Scan all upcoming games for +EV bets using Pinnacle no-vig as true probability.
+        Covers game lines (h2h, spreads, totals) and player props.
+        """
+        games = await self.odds.get_games()
+        ev_bets: list[ValueBet] = []
+
+        for game in games:
+            # --- Game lines ---
+            try:
+                pinnacle = await self.odds.get_pinnacle_odds(game.id)
+                if pinnacle:
+                    lines = await self.odds.get_odds(game.id)
+                    ev_bets.extend(self._scan_game_ev(game, lines, pinnacle, min_edge))
+            except Exception as exc:
+                logger.warning("+EV scan (game lines) failed for %s: %s", game.id, exc)
+
+            # --- Player props ---
+            try:
+                pinnacle_props = await self.odds.get_pinnacle_props(game.id)
+                if pinnacle_props:
+                    props = await self.odds.get_player_props(game.id)
+                    ev_bets.extend(self._scan_props_ev(game, props, pinnacle_props, min_edge))
+            except Exception as exc:
+                logger.warning("+EV scan (props) failed for %s: %s", game.id, exc)
+
+        ev_bets.sort(key=lambda b: b.edge, reverse=True)
+        return ev_bets
+
+    def _scan_game_ev(
+        self, game: Any, lines: list, pinnacle: Any, min_edge: float
+    ) -> list[ValueBet]:
+        bets: list[ValueBet] = []
+
+        # h2h
+        if pinnacle.moneyline_home and pinnacle.moneyline_away:
+            true_home, true_away = self.no_vig_prob(pinnacle.moneyline_home, pinnacle.moneyline_away)
+            for line in lines:
+                if line.bookmaker == "pinnacle":
+                    continue
+                for team, true_prob, odds in [
+                    (game.home_team, true_home, line.moneyline_home),
+                    (game.away_team, true_away, line.moneyline_away),
+                ]:
+                    if odds is None:
+                        continue
+                    imp = self.implied_probability(odds)
+                    edge = true_prob - imp
+                    if edge >= min_edge:
+                        dec = self.american_to_decimal(odds)
+                        bets.append(ValueBet(
+                            event_id=game.id, market="h2h", selection=team,
+                            bookmaker=line.bookmaker, american_odds=odds,
+                            implied_probability=round(imp, 4),
+                            true_probability=round(true_prob, 4),
+                            edge=round(edge, 4),
+                            kelly_fraction=self.kelly_criterion(edge, dec),
+                            confidence=self._confidence(edge),
+                        ))
+
+        # spreads
+        if pinnacle.spread:
+            pinn_home_p, pinn_away_p = self.no_vig_prob(pinnacle.spread.home_price, pinnacle.spread.away_price)
+            for line in lines:
+                if line.bookmaker == "pinnacle" or not line.spread:
+                    continue
+                if (
+                    line.spread.home_point != pinnacle.spread.home_point
+                    or line.spread.away_point != pinnacle.spread.away_point
+                ):
+                    continue
+                for team, true_prob, odds, point in [
+                    (game.home_team, pinn_home_p, line.spread.home_price, line.spread.home_point),
+                    (game.away_team, pinn_away_p, line.spread.away_price, line.spread.away_point),
+                ]:
+                    imp = self.implied_probability(odds)
+                    edge = true_prob - imp
+                    if edge >= min_edge:
+                        dec = self.american_to_decimal(odds)
+                        bets.append(ValueBet(
+                            event_id=game.id, market="spreads",
+                            selection=f"{team} {point:+.1f}",
+                            bookmaker=line.bookmaker, american_odds=odds,
+                            implied_probability=round(imp, 4),
+                            true_probability=round(true_prob, 4),
+                            edge=round(edge, 4),
+                            kelly_fraction=self.kelly_criterion(edge, dec),
+                            confidence=self._confidence(edge),
+                        ))
+
+        # totals
+        if pinnacle.total:
+            pinn_over_p, pinn_under_p = self.no_vig_prob(pinnacle.total.over_price, pinnacle.total.under_price)
+            for line in lines:
+                if line.bookmaker == "pinnacle" or not line.total:
+                    continue
+                if line.total.point != pinnacle.total.point:
+                    continue
+                for side, true_prob, odds in [
+                    ("Over", pinn_over_p, line.total.over_price),
+                    ("Under", pinn_under_p, line.total.under_price),
+                ]:
+                    imp = self.implied_probability(odds)
+                    edge = true_prob - imp
+                    if edge >= min_edge:
+                        dec = self.american_to_decimal(odds)
+                        bets.append(ValueBet(
+                            event_id=game.id, market="totals",
+                            selection=f"{side} {pinnacle.total.point}",
+                            bookmaker=line.bookmaker, american_odds=odds,
+                            implied_probability=round(imp, 4),
+                            true_probability=round(true_prob, 4),
+                            edge=round(edge, 4),
+                            kelly_fraction=self.kelly_criterion(edge, dec),
+                            confidence=self._confidence(edge),
+                        ))
+        return bets
+
+    def _scan_props_ev(
+        self, game: Any, props: list, pinnacle_props: list, min_edge: float
+    ) -> list[ValueBet]:
+        # Build Pinnacle no-vig map keyed by (player_name, market, line)
+        pinn_map: dict[tuple, tuple[float, float]] = {}
+        for pp in pinnacle_props:
+            if pp.over_price > _MAX_PROP_ODDS or pp.under_price > _MAX_PROP_ODDS:
+                continue
+            true_over, true_under = self.no_vig_prob(pp.over_price, pp.under_price)
+            pinn_map[(pp.player_name, pp.market, pp.line)] = (true_over, true_under)
+
+        bets: list[ValueBet] = []
+        for p in props:
+            if p.bookmaker == "pinnacle":
+                continue
+            if p.over_price > _MAX_PROP_ODDS or p.under_price > _MAX_PROP_ODDS:
+                continue
+            key = (p.player_name, p.market, p.line)
+            if key not in pinn_map:
+                continue
+            true_over, true_under = pinn_map[key]
+            for side, true_prob, odds in [
+                ("Over", true_over, p.over_price),
+                ("Under", true_under, p.under_price),
+            ]:
+                imp = self.implied_probability(odds)
+                edge = true_prob - imp
+                if edge >= min_edge:
+                    dec = self.american_to_decimal(odds)
+                    flag = " ⚠" if _WARN_PROP_ODDS < odds <= _MAX_PROP_ODDS else ""
+                    bets.append(ValueBet(
+                        event_id=game.id,
+                        market=p.market,
+                        selection=f"{p.player_name} {side} {p.line}{flag}",
+                        bookmaker=p.bookmaker,
+                        american_odds=odds,
+                        implied_probability=round(imp, 4),
+                        true_probability=round(true_prob, 4),
+                        edge=round(edge, 4),
+                        kelly_fraction=self.kelly_criterion(edge, dec),
+                        confidence=self._confidence(edge),
+                    ))
+        return bets
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -554,68 +618,6 @@ class AnalysisService:
         except Exception as exc:
             logger.warning("_calculate_usage_adjustment failed: %s", exc)
             return 0.0
-
-    async def _get_opening_prop_lines(
-        self,
-        event_id: str,
-        commence_time: Optional[datetime],
-        markets: list[str],
-    ) -> dict[str, dict[str, float]]:
-        """Return {player_name: {market: opening_line}} from 48h-before snapshot.
-        NOTE: Disabled — historical API returns EVENT_NOT_FOUND for concluded games.
-        """
-        return {}
-
-        # if commence_time is None or not markets:
-        #     return {}
-
-        # opening_ts = (commence_time - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        # try:
-        #     hist = await self.odds.get_historical_event_odds(event_id, opening_ts, markets=markets)
-        # except Exception as exc:
-        #     logger.debug("Could not fetch opening prop lines: %s", exc)
-        #     return {}
-
-        # hist_data = hist.get("data") or {}
-        # result: dict[str, dict[str, float]] = {}
-
-        # for bookmaker in hist_data.get("bookmakers", []):
-        #     for market in bookmaker.get("markets", []):
-        #         market_key = market.get("key", "")
-        #         for outcome in market.get("outcomes", []):
-        #             player_name = outcome.get("description", outcome.get("name", ""))
-        #             if not player_name or "point" not in outcome:
-        #                 continue
-        #             result.setdefault(player_name, {})
-        #             if market_key not in result[player_name]:
-        #                 result[player_name][market_key] = float(outcome["point"])
-
-        # return result
-
-    async def _find_player(self, name: str) -> Optional[dict[str, Any]]:
-        try:
-            from nba_api.stats.static import players as nba_players
-
-            name_lower = name.lower()
-            for p in nba_players.get_active_players():
-                if name_lower in p["full_name"].lower():
-                    return p
-        except Exception:
-            pass
-        return None
-
-    def _prop_market_to_stat_col(self, market: str) -> Optional[str]:
-        mapping = {
-            "player_points": "PTS",
-            "player_rebounds": "REB",
-            "player_assists": "AST",
-            "player_threes": "FG3M",
-            "player_blocks": "BLK",
-            "player_steals": "STL",
-            "player_turnovers": "TOV",
-            "player_double_double": None,
-        }
-        return mapping.get(market)
 
     @staticmethod
     def _normal_cdf(z: float) -> float:

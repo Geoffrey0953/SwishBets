@@ -31,9 +31,9 @@ class StatsService:
     # ------------------------------------------------------------------
 
     def _get_scoreboard(self, game_date: date):
-        from nba_api.stats.endpoints import scoreboard
+        from nba_api.stats.endpoints import scoreboardv3
 
-        return scoreboard.Scoreboard(game_date=game_date.strftime("%Y-%m-%d"))
+        return scoreboardv3.ScoreboardV3(game_date=game_date.strftime("%Y-%m-%d"))
 
     def _get_team_game_logs(self, team_id: int, last_n: int):
         from nba_api.stats.endpoints import teamgamelogs
@@ -83,16 +83,16 @@ class StatsService:
         try:
             print(f"[API CALL]   nba_api → Scoreboard.get_data_frame() for {game_date}")
             board = self._get_scoreboard(game_date)
-            games_df = board.game_header.get_data_frame()
+            raw_games = board.get_dict()["scoreboard"]["games"]
             games: list[Game] = []
-            for _, row in games_df.iterrows():
+            for g in raw_games:
                 games.append(
                     Game(
-                        id=str(row.get("GAME_ID", "")),
-                        home_team=str(row.get("HOME_TEAM_ABBREVIATION", "")),
-                        away_team=str(row.get("VISITOR_TEAM_ABBREVIATION", "")),
+                        id=str(g.get("gameId", "")),
+                        home_team=g["homeTeam"].get("teamTricode", ""),
+                        away_team=g["awayTeam"].get("teamTricode", ""),
                         commence_time=datetime.combine(game_date, datetime.min.time()),
-                        status=str(row.get("GAME_STATUS_TEXT", "")),
+                        status=str(g.get("gameStatusText", "")),
                     )
                 )
         except Exception as exc:
@@ -112,7 +112,7 @@ class StatsService:
         try:
             print(f"[API CALL]   nba_api → TeamGameLogs.get_data_frame() team={team_id} last_n={last_n}")
             logs = self._get_team_game_logs(team_id, last_n)
-            df = logs.team_game_logs.get_data_frame()
+            df = logs.team_game_logs.get_data_frame().head(last_n)
 
             if df.empty:
                 raise ValueError("No game log data returned")
@@ -196,15 +196,14 @@ class StatsService:
         await self.cache.set(cache_key, stats.model_dump(), STATS)
         return stats
 
-# Added Last n games
-    async def get_player_stats(self, player_id: int, last_n: int) -> dict[str, Any]:
-        cache_key = f"player_stats:{player_id}"
+    async def get_player_stats(self, player_id: int, last_n: int = 10) -> list[dict[str, Any]]:
+        cache_key = f"player_stats:{player_id}:{last_n}"
         cached = await self.cache.get(cache_key)
         if cached:
             return cached
 
         try:
-            print(f"[API CALL]   nba_api → PlayerGameLogs.get_data_frame() player={player_id}")
+            print(f"[API CALL]   nba_api → PlayerGameLogs.get_data_frame() player={player_id} last_n={last_n}")
             logs = self._get_player_game_logs(player_id)
             df = logs.player_game_logs.get_data_frame()
             result = df.head(last_n).to_dict(orient="records")
@@ -218,7 +217,7 @@ class StatsService:
     async def get_head_to_head(
         self, team1_id: int, team2_id: int, num_games: int = 10
     ) -> HeadToHeadResult:
-        cache_key = f"h2h:{min(team1_id,team2_id)}:{max(team1_id,team2_id)}:{num_games}"
+        cache_key = f"h2h:{team1_id}:{team2_id}:{num_games}"
         cached = await self.cache.get(cache_key)
         if cached:
             return HeadToHeadResult(**cached)
@@ -336,6 +335,7 @@ class StatsService:
             df = standings.standings.get_data_frame()
             records = df[
                 [
+                    "TeamCity",
                     "TeamName",
                     "Conference",
                     "PlayoffRank",
@@ -417,7 +417,7 @@ class StatsService:
             return cached
 
         try:
-            game_logs = await self.get_player_stats(player_id)
+            game_logs = await self.get_player_stats(player_id, last_n=last_n)
             minutes: list[float] = []
             for g in game_logs[:last_n]:
                 raw = g.get("MIN")

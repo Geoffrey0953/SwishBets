@@ -49,7 +49,8 @@ class OddsService:
         sport: str = "basketball_nba",
         game_date: Optional[date] = None,
     ) -> list[Game]:
-        cache_key = f"games:{sport}:{game_date or 'today'}"
+        from datetime import date as _date
+        cache_key = f"games:{sport}:{game_date or _date.today()}"
         cached = await self.cache.get(cache_key)
         if cached:
             return [Game(**g) for g in cached]
@@ -89,48 +90,12 @@ class OddsService:
 
         data = await self._get(
             f"/sports/basketball_nba/events/{event_id}/odds",
-            params={"markets": ",".join(markets), "oddsFormat": "american", "regions": "us"},
+            params={"markets": ",".join(markets), "oddsFormat": "american", "regions": "us,us2,us_ex"},
         )
 
         lines: list[OddsLine] = []
         for bookmaker in data.get("bookmakers", []):
-            line = OddsLine(
-                event_id=event_id,
-                home_team=data["home_team"],
-                away_team=data["away_team"],
-                commence_time=datetime.fromisoformat(
-                    data["commence_time"].replace("Z", "+00:00")
-                ),
-                bookmaker=bookmaker["key"],
-            )
-            for market in bookmaker.get("markets", []):
-                key = market["key"]
-                outcomes = {o["name"]: o for o in market["outcomes"]}
-                if key == "h2h":
-                    home_out = outcomes.get(data["home_team"])
-                    away_out = outcomes.get(data["away_team"])
-                    if home_out:
-                        line.moneyline_home = int(home_out["price"])
-                    if away_out:
-                        line.moneyline_away = int(away_out["price"])
-                elif key == "spreads":
-                    home_out = outcomes.get(data["home_team"])
-                    if home_out:
-                        line.spread = Spread(
-                            team=data["home_team"],
-                            point=home_out["point"],
-                            price=int(home_out["price"]),
-                        )
-                elif key == "totals":
-                    over_out = outcomes.get("Over")
-                    under_out = outcomes.get("Under")
-                    if over_out and under_out:
-                        line.total = Total(
-                            point=over_out["point"],
-                            over_price=int(over_out["price"]),
-                            under_price=int(under_out["price"]),
-                        )
-            lines.append(line)
+            lines.append(self._parse_bookmaker_odds(event_id, data, bookmaker))
 
         await self.cache.set(cache_key, [l.model_dump() for l in lines], ODDS)
         return lines
@@ -155,41 +120,138 @@ class OddsService:
 
         data = await self._get(
             f"/sports/basketball_nba/events/{event_id}/odds",
-            params={"markets": ",".join(markets), "oddsFormat": "american", "regions": "us"},
+            params={"markets": ",".join(markets), "oddsFormat": "american", "regions": "us,us2,us_ex,us_dfs"},
         )
 
         props: list[PlayerProp] = []
         for bookmaker in data.get("bookmakers", []):
-            for market in bookmaker.get("markets", []):
-                market_key = market["key"]
-                outcomes = market.get("outcomes", [])
-                # Group by player description (name)
-                players: dict[str, dict] = {}
-                for outcome in outcomes:
-                    name = outcome.get("description", outcome.get("name", ""))
-                    side = outcome["name"]  # "Over" or "Under"
-                    players.setdefault(name, {})
-                    players[name]["line"] = outcome.get("point", 0)
-                    if side == "Over":
-                        players[name]["over_price"] = int(outcome["price"])
-                    else:
-                        players[name]["under_price"] = int(outcome["price"])
-
-                for player_name, pdata in players.items():
-                    if "over_price" in pdata and "under_price" in pdata:
-                        props.append(
-                            PlayerProp(
-                                event_id=event_id,
-                                player_name=player_name,
-                                market=market_key,
-                                line=pdata["line"],
-                                over_price=pdata["over_price"],
-                                under_price=pdata["under_price"],
-                                bookmaker=bookmaker["key"],
-                            )
-                        )
+            props.extend(self._parse_bookmaker_props(event_id, bookmaker))
 
         await self.cache.set(cache_key, [p.model_dump() for p in props], PROPS)
+        return props
+
+    async def get_pinnacle_odds(
+        self,
+        event_id: str,
+        markets: Optional[list[str]] = None,
+    ) -> Optional[OddsLine]:
+        """Fetch Pinnacle-only game odds. Returns None if unavailable."""
+        if markets is None:
+            markets = ["h2h", "spreads", "totals"]
+
+        cache_key = f"pinnacle_odds:{event_id}:{','.join(markets)}"
+        cached = await self.cache.get(cache_key)
+        if cached:
+            return OddsLine(**cached)
+
+        data = await self._get(
+            f"/sports/basketball_nba/events/{event_id}/odds",
+            params={"markets": ",".join(markets), "oddsFormat": "american", "regions": "eu"},
+        )
+        pinnacle = next((b for b in data.get("bookmakers", []) if b["key"] == "pinnacle"), None)
+        if not pinnacle:
+            return None
+
+        line = self._parse_bookmaker_odds(event_id, data, pinnacle)
+        await self.cache.set(cache_key, line.model_dump(), ODDS)
+        return line
+
+    async def get_pinnacle_props(
+        self,
+        event_id: str,
+        markets: Optional[list[str]] = None,
+    ) -> list[PlayerProp]:
+        """Fetch Pinnacle-only player props. Returns [] if unavailable."""
+        if markets is None:
+            markets = ["player_points", "player_rebounds", "player_assists"]
+
+        cache_key = f"pinnacle_props:{event_id}:{','.join(markets)}"
+        cached = await self.cache.get(cache_key)
+        if cached:
+            return [PlayerProp(**p) for p in cached]
+
+        data = await self._get(
+            f"/sports/basketball_nba/events/{event_id}/odds",
+            params={"markets": ",".join(markets), "oddsFormat": "american", "regions": "eu"},
+        )
+        pinnacle = next((b for b in data.get("bookmakers", []) if b["key"] == "pinnacle"), None)
+        if not pinnacle:
+            return []
+
+        props = self._parse_bookmaker_props(event_id, pinnacle)
+        await self.cache.set(cache_key, [p.model_dump() for p in props], PROPS)
+        return props
+
+    def _parse_bookmaker_odds(self, event_id: str, data: dict, bookmaker: dict) -> OddsLine:
+        line = OddsLine(
+            event_id=event_id,
+            home_team=data["home_team"],
+            away_team=data["away_team"],
+            commence_time=datetime.fromisoformat(
+                data["commence_time"].replace("Z", "+00:00")
+            ),
+            bookmaker=bookmaker["key"],
+        )
+        for market in bookmaker.get("markets", []):
+            key = market["key"]
+            outcomes = {o["name"]: o for o in market["outcomes"]}
+            if key == "h2h":
+                home_out = outcomes.get(data["home_team"])
+                away_out = outcomes.get(data["away_team"])
+                if home_out:
+                    line.moneyline_home = int(home_out["price"])
+                if away_out:
+                    line.moneyline_away = int(away_out["price"])
+            elif key == "spreads":
+                home_out = outcomes.get(data["home_team"])
+                away_out = outcomes.get(data["away_team"])
+                if home_out and away_out:
+                    line.spread = Spread(
+                        home_team=data["home_team"],
+                        home_point=home_out["point"],
+                        home_price=int(home_out["price"]),
+                        away_team=data["away_team"],
+                        away_point=away_out["point"],
+                        away_price=int(away_out["price"]),
+                    )
+            elif key == "totals":
+                over_out = outcomes.get("Over")
+                under_out = outcomes.get("Under")
+                if over_out and under_out:
+                    line.total = Total(
+                        point=over_out["point"],
+                        over_price=int(over_out["price"]),
+                        under_price=int(under_out["price"]),
+                    )
+        return line
+
+    def _parse_bookmaker_props(self, event_id: str, bookmaker: dict) -> list[PlayerProp]:
+        props: list[PlayerProp] = []
+        for market in bookmaker.get("markets", []):
+            market_key = market["key"]
+            players: dict[str, dict] = {}
+            for outcome in market.get("outcomes", []):
+                name = outcome.get("description", outcome.get("name", ""))
+                side = outcome["name"]  # "Over" or "Under"
+                players.setdefault(name, {})
+                players[name]["line"] = outcome.get("point", 0)
+                if side == "Over":
+                    players[name]["over_price"] = int(outcome["price"])
+                else:
+                    players[name]["under_price"] = int(outcome["price"])
+            for player_name, pdata in players.items():
+                if "over_price" in pdata and "under_price" in pdata:
+                    props.append(
+                        PlayerProp(
+                            event_id=event_id,
+                            player_name=player_name,
+                            market=market_key,
+                            line=pdata["line"],
+                            over_price=pdata["over_price"],
+                            under_price=pdata["under_price"],
+                            bookmaker=bookmaker["key"],
+                        )
+                    )
         return props
 
     async def get_historical_event_odds(
@@ -240,8 +302,10 @@ class OddsService:
                 }
             elif market == "spreads" and line.spread:
                 result[line.bookmaker] = {
-                    "point": line.spread.point,
-                    "price": line.spread.price,
+                    "home_point": line.spread.home_point,
+                    "home_price": line.spread.home_price,
+                    "away_point": line.spread.away_point,
+                    "away_price": line.spread.away_price,
                 }
             elif market == "totals" and line.total:
                 result[line.bookmaker] = {
@@ -270,7 +334,7 @@ class OddsService:
             )
 
         ref = lines[0]
-        current_point = ref.spread.point
+        current_point = ref.spread.home_point
 
         # Compute opening timestamp: 48 hours before tip-off
         opening_ts = (ref.commence_time - timedelta(hours=48)).strftime(

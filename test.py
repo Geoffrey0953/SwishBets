@@ -19,9 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.schemas import (
     Game,
-    InjuryReport,
     OddsLine,
-    PlayerProp,
     Spread,
     TeamStats,
     Total,
@@ -76,7 +74,10 @@ def _make_odds_line(
         bookmaker=bookmaker,
         moneyline_home=home_ml,
         moneyline_away=away_ml,
-        spread=Spread(team="Los Angeles Lakers", point=spread_point, price=-110),
+        spread=Spread(
+            home_team="Los Angeles Lakers", home_point=spread_point, home_price=-110,
+            away_team="Golden State Warriors", away_point=-spread_point, away_price=-110,
+        ),
         total=Total(point=220.5, over_price=-110, under_price=-110),
     )
 
@@ -280,42 +281,6 @@ class TestNormalCDF(unittest.TestCase):
         self.assertLess(AnalysisService._normal_cdf(-4.0), 0.001)
 
 
-class TestPropMarketToStatCol(unittest.TestCase):
-
-    def setUp(self):
-        self.svc = _make_analysis_svc()
-
-    def test_points(self):
-        self.assertEqual(self.svc._prop_market_to_stat_col("player_points"), "PTS")
-
-    def test_rebounds(self):
-        self.assertEqual(self.svc._prop_market_to_stat_col("player_rebounds"), "REB")
-
-    def test_assists(self):
-        self.assertEqual(self.svc._prop_market_to_stat_col("player_assists"), "AST")
-
-    def test_threes(self):
-        self.assertEqual(self.svc._prop_market_to_stat_col("player_threes"), "FG3M")
-
-    def test_blocks(self):
-        self.assertEqual(self.svc._prop_market_to_stat_col("player_blocks"), "BLK")
-
-    def test_steals(self):
-        self.assertEqual(self.svc._prop_market_to_stat_col("player_steals"), "STL")
-
-    def test_turnovers(self):
-        self.assertEqual(self.svc._prop_market_to_stat_col("player_turnovers"), "TOV")
-
-    def test_double_double_explicitly_none(self):
-        self.assertIsNone(self.svc._prop_market_to_stat_col("player_double_double"))
-
-    def test_unknown_market_returns_none(self):
-        self.assertIsNone(self.svc._prop_market_to_stat_col("player_fantasy_points"))
-
-    def test_empty_string_returns_none(self):
-        self.assertIsNone(self.svc._prop_market_to_stat_col(""))
-
-
 # ---------------------------------------------------------------------------
 # Group 2 — Bug 3: get_player_stats always caps at 10 rows
 # ---------------------------------------------------------------------------
@@ -494,17 +459,14 @@ class TestBestBookmakerAttribution(unittest.TestCase):
             "The best available odds (+150) should be correctly selected.",
         )
 
-    def test_bookmaker_attribution_is_bugged(self):
-        """BUG 4: bookmaker attribute is 'bookmaker_c' (last) instead of 'bookmaker_b' (best odds).
-        This test CONFIRMS the bug. After fix, expected value is 'bookmaker_b'.
-        """
+    def test_bookmaker_attribution_is_correct(self):
+        """bookmaker attribute should be 'bookmaker_b' — the one with the best odds (+150)."""
         bet = self._run_scenario()
         self.assertIsNotNone(bet)
         self.assertEqual(
-            bet.bookmaker, "bookmaker_c",
-            f"BUG 4: bookmaker='{bet.bookmaker}'. "
-            "Last bookmaker in loop is used, not the one offering the best odds. "
-            "After fix this should be 'bookmaker_b'.",
+            bet.bookmaker, "bookmaker_b",
+            f"bookmaker='{bet.bookmaker if bet else None}'. "
+            "Should point to the bookmaker offering the best odds, not the last one in the list.",
         )
 
 
@@ -569,7 +531,7 @@ class TestGetLineMovement(unittest.TestCase):
             away_team="Warriors",
             commence_time=datetime(2026, 3, 21, 19, 0, tzinfo=timezone.utc),
             bookmaker="dk",
-            spread=Spread(team="Lakers", point=-7.5, price=-110),
+            spread=Spread(home_team="Lakers", home_point=-7.5, home_price=-110, away_team="Warriors", away_point=7.5, away_price=-110),
         )
         hist = {
             "data": {
@@ -606,7 +568,7 @@ class TestGetLineMovement(unittest.TestCase):
             away_team="Warriors",
             commence_time=datetime(2026, 3, 21, 19, 0, tzinfo=timezone.utc),
             bookmaker="dk",
-            spread=Spread(team="Lakers", point=-3.5, price=-110),
+            spread=Spread(home_team="Lakers", home_point=-3.5, home_price=-110, away_team="Warriors", away_point=3.5, away_price=-110),
         )
         hist = {
             "data": {
@@ -682,8 +644,8 @@ class TestCompareBooks(unittest.TestCase):
 
         self.svc.get_odds = mock_odds
         result = run(self.svc.compare_books("test_game", "spreads"))
-        self.assertEqual(result["dk"]["point"], -5.5)
-        self.assertEqual(result["fd"]["point"], -6.0)
+        self.assertEqual(result["dk"]["home_point"], -5.5)
+        self.assertEqual(result["fd"]["home_point"], -6.0)
 
     def test_totals_market(self):
         lines = [_make_odds_line("dk", -150, 130)]
@@ -707,6 +669,70 @@ class TestCompareBooks(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Group 6b — exact-line matching for arb / EV
+# ---------------------------------------------------------------------------
+
+class TestExactLineMatching(unittest.TestCase):
+
+    def setUp(self):
+        self.svc = _make_analysis_svc()
+        self.game = _make_game()
+
+    def test_totals_arb_does_not_cross_different_points(self):
+        over_210 = _make_odds_line("book_over", -110, +100)
+        over_210.total = Total(point=210.5, over_price=+140, under_price=-110)
+
+        under_212 = _make_odds_line("book_under", -110, +100)
+        under_212.total = Total(point=212.5, over_price=-110, under_price=+140)
+
+        result = self.svc._scan_game_lines_for_arb(
+            self.game, [over_210, under_212], min_arb_pct=0.001
+        )
+
+        self.assertEqual(result, [])
+
+    def test_totals_arb_allows_same_point(self):
+        over_211 = _make_odds_line("book_over", -110, +100)
+        over_211.total = Total(point=211.5, over_price=+140, under_price=-110)
+
+        under_211 = _make_odds_line("book_under", -110, +100)
+        under_211.total = Total(point=211.5, over_price=-110, under_price=+140)
+
+        result = self.svc._scan_game_lines_for_arb(
+            self.game, [over_211, under_211], min_arb_pct=0.001
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].side_a, "Over 211.5")
+        self.assertEqual(result[0].side_b, "Under 211.5")
+
+    def test_spread_ev_skips_different_point_than_pinnacle(self):
+        pinnacle = _make_odds_line("pinnacle", -110, -110, spread_point=-5.5)
+        off_market = _make_odds_line("book", -110, -110, spread_point=-7.5)
+        off_market.spread.home_price = +140
+        off_market.spread.away_price = +140
+
+        result = self.svc._scan_game_ev(
+            self.game, [off_market], pinnacle, min_edge=0.001
+        )
+
+        self.assertEqual(result, [])
+
+    def test_total_ev_skips_different_point_than_pinnacle(self):
+        pinnacle = _make_odds_line("pinnacle", -110, -110)
+        pinnacle.total = Total(point=211.5, over_price=-110, under_price=-110)
+
+        off_market = _make_odds_line("book", -110, -110)
+        off_market.total = Total(point=213.5, over_price=+140, under_price=+140)
+
+        result = self.svc._scan_game_ev(
+            self.game, [off_market], pinnacle, min_edge=0.001
+        )
+
+        self.assertEqual(result, [])
+
+
+# ---------------------------------------------------------------------------
 # Group 7 — get_player_minutes_consistency
 # ---------------------------------------------------------------------------
 
@@ -719,7 +745,7 @@ class TestMinutesConsistency(unittest.TestCase):
     def _patch(self, minutes_list):
         logs = [{"MIN": str(m)} for m in minutes_list]
 
-        async def mock_gps(pid):
+        async def mock_gps(pid, last_n=10):
             return logs
 
         self.svc.get_player_stats = mock_gps
@@ -756,7 +782,7 @@ class TestMinutesConsistency(unittest.TestCase):
         # "32:30"→32.5, "31:00"→31.0, "33:00"→33.0 → mean≈32.2
         logs = [{"MIN": "32:30"}, {"MIN": "31:00"}, {"MIN": "33:00"}]
 
-        async def mock_gps(pid):
+        async def mock_gps(pid, last_n=10):
             return logs
 
         self.svc.get_player_stats = mock_gps
@@ -765,7 +791,7 @@ class TestMinutesConsistency(unittest.TestCase):
         self.assertAlmostEqual(result["mean_minutes"], 32.2, delta=0.1)
 
     def test_empty_logs_fallback(self):
-        async def mock_gps(pid):
+        async def mock_gps(pid, last_n=10):
             return []
 
         self.svc.get_player_stats = mock_gps
@@ -776,7 +802,7 @@ class TestMinutesConsistency(unittest.TestCase):
     def test_none_min_skipped(self):
         logs = [{"MIN": None}, {"MIN": "32"}, {"MIN": "33"}, {"MIN": "31"}]
 
-        async def mock_gps(pid):
+        async def mock_gps(pid, last_n=10):
             return logs
 
         self.svc.get_player_stats = mock_gps
@@ -790,7 +816,7 @@ class TestMinutesConsistency(unittest.TestCase):
         })
         call_count = {"n": 0}
 
-        async def counting(pid):
+        async def counting(pid, last_n=10):
             call_count["n"] += 1
             return []
 
@@ -1010,143 +1036,6 @@ class TestFindValueBets(unittest.TestCase):
         odds_mock.get_games = AsyncMock(return_value=[])
         svc = _make_analysis_svc(odds_mock=odds_mock)
         self.assertEqual(run(svc.find_value_bets()), [])
-
-
-# ---------------------------------------------------------------------------
-# Group 11 — find_value_props z-score and edge logic
-# ---------------------------------------------------------------------------
-
-class TestFindValueProps(unittest.TestCase):
-
-    def _make_logs(self, pts_values):
-        return [
-            {
-                "PTS": v, "REB": 5.0, "AST": 7.0, "FG3M": 2.0,
-                "BLK": 1.0, "STL": 1.0, "TOV": 2.0,
-                "MIN": "35", "TEAM_ABBREVIATION": "LAL",
-            }
-            for v in pts_values
-        ]
-
-    def _make_svc(self, logs, prop_line, minutes_grade="very_consistent", is_b2b=False):
-        prop = PlayerProp(
-            event_id="test_game", player_name="LeBron James",
-            market="player_points", line=prop_line,
-            over_price=-110, under_price=-110, bookmaker="dk",
-        )
-        h2h_line = _make_odds_line("dk", -150, 130)
-
-        home_stats = _make_team_stats(1610612747, "Lakers", wins=5, losses=5)
-        away_stats = _make_team_stats(1610612744, "Warriors", wins=5, losses=5)
-
-        odds_mock = MagicMock(spec=OddsService)
-        odds_mock.get_player_props = AsyncMock(return_value=[prop])
-        odds_mock.get_odds = AsyncMock(return_value=[h2h_line])
-        odds_mock.get_historical_event_odds = AsyncMock(return_value={})
-
-        stats_mock = MagicMock(spec=StatsService)
-        stats_mock.find_team_by_name = MagicMock(
-            side_effect=lambda name: (
-                {"id": 1610612747, "full_name": "Los Angeles Lakers"}
-                if "Lakers" in name
-                else {"id": 1610612744, "full_name": "Golden State Warriors"}
-            )
-        )
-        stats_mock.get_team_stats = AsyncMock(
-            side_effect=lambda tid, last_n=10: (
-                home_stats if tid == 1610612747 else away_stats
-            )
-        )
-        stats_mock.get_injury_report = AsyncMock(
-            return_value=InjuryReport(team_id=1610612747, team_name="Lakers")
-        )
-        stats_mock.get_player_stats = AsyncMock(return_value=logs)
-        stats_mock.get_player_minutes_consistency = AsyncMock(
-            return_value={"grade": minutes_grade, "mean_minutes": 35.0,
-                          "std_dev": 1.0, "games": len(logs)}
-        )
-        stats_mock.is_team_on_back_to_back = AsyncMock(return_value=is_b2b)
-
-        svc = _make_analysis_svc(odds_mock=odds_mock, stats_mock=stats_mock)
-
-        async def mock_usage(*args, **kwargs):
-            return 0.0
-
-        async def mock_opening(*args, **kwargs):
-            return {}
-
-        async def mock_find_player(name):
-            return {"id": 2544, "full_name": name, "TEAM_ABBREVIATION": "LAL"}
-
-        svc._calculate_usage_adjustment = mock_usage
-        svc._get_opening_prop_lines = mock_opening
-        svc._find_player = mock_find_player
-        return svc
-
-    def test_over_bet_when_avg_well_above_line(self):
-        logs = self._make_logs([28.0] * 10)
-        svc = self._make_svc(logs, prop_line=22.0)
-        bets = run(svc.find_value_props("test_game"))
-        over_bets = [b for b in bets if "Over" in b.selection]
-        self.assertGreater(len(over_bets), 0)
-
-    def test_under_bet_when_avg_well_below_line(self):
-        logs = self._make_logs([16.0] * 10)
-        svc = self._make_svc(logs, prop_line=24.5)
-        bets = run(svc.find_value_props("test_game"))
-        under_bets = [b for b in bets if "Under" in b.selection]
-        self.assertGreater(len(under_bets), 0)
-
-    def test_edge_positive_for_over_when_avg_above_line(self):
-        logs = self._make_logs([28.0] * 10)
-        svc = self._make_svc(logs, prop_line=22.0)
-        bets = run(svc.find_value_props("test_game"))
-        over_bets = [b for b in bets if "Over" in b.selection]
-        if over_bets:
-            self.assertGreater(over_bets[0].edge, 0)
-            self.assertGreater(over_bets[0].true_probability, over_bets[0].implied_probability)
-
-    def test_high_confidence_for_very_easy_over(self):
-        logs = self._make_logs([30.0] * 10)
-        svc = self._make_svc(logs, prop_line=18.0)
-        bets = run(svc.find_value_props("test_game"))
-        over_bets = [b for b in bets if "Over" in b.selection]
-        if over_bets:
-            self.assertEqual(over_bets[0].confidence, "High")
-
-    def test_b2b_flag_propagated(self):
-        logs = self._make_logs([28.0] * 10)
-        svc = self._make_svc(logs, prop_line=22.0, is_b2b=True)
-        bets = run(svc.find_value_props("test_game"))
-        b2b_bets = [b for b in bets if b.back_to_back is True]
-        if bets:
-            self.assertGreater(len(b2b_bets), 0)
-
-    def test_minutes_grade_propagated(self):
-        logs = self._make_logs([28.0] * 10)
-        svc = self._make_svc(logs, prop_line=22.0, minutes_grade="very_consistent")
-        bets = run(svc.find_value_props("test_game"))
-        if bets:
-            self.assertEqual(bets[0].minutes_grade, "very_consistent")
-
-    def test_fewer_than_3_games_skipped(self):
-        logs = self._make_logs([28.0, 27.0])
-        svc = self._make_svc(logs, prop_line=20.0)
-        bets = run(svc.find_value_props("test_game"))
-        self.assertEqual(bets, [])
-
-    def test_sorted_by_edge_descending(self):
-        logs = self._make_logs([28.0] * 10)
-        svc = self._make_svc(logs, prop_line=22.0)
-        bets = run(svc.find_value_props("test_game"))
-        for i in range(len(bets) - 1):
-            self.assertGreaterEqual(bets[i].edge, bets[i + 1].edge)
-
-    def test_empty_props_returns_empty(self):
-        odds_mock = MagicMock(spec=OddsService)
-        odds_mock.get_player_props = AsyncMock(return_value=[])
-        svc = _make_analysis_svc(odds_mock=odds_mock)
-        self.assertEqual(run(svc.find_value_props("test_game")), [])
 
 
 # ---------------------------------------------------------------------------
