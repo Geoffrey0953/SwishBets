@@ -20,9 +20,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from models.schemas import (
     Game,
     OddsLine,
+    PlayerProp,
     Spread,
     TeamStats,
     Total,
+    ValueBet,
 )
 from services.analysis_service import AnalysisService
 from services.defense_service import DefenseService
@@ -190,13 +192,14 @@ class TestCalculateEdge(unittest.TestCase):
 
 
 class TestKellyCriterion(unittest.TestCase):
+    """Quarter-Kelly: full_kelly * 0.25, capped at 6.25% (0.0625)."""
 
     def setUp(self):
         self.svc = _make_analysis_svc()
 
     def test_even_money_ten_pct_edge(self):
-        # +100 → decimal=2.0, edge=0.10 → kelly = 0.10*2.0/1.0 = 0.20
-        self.assertAlmostEqual(self.svc.kelly_criterion(0.10, 2.0), 0.20, places=4)
+        # full_kelly = 0.10*2.0/1.0 = 0.20 → quarter = 0.05
+        self.assertAlmostEqual(self.svc.kelly_criterion(0.10, 2.0), 0.05, places=4)
 
     def test_zero_edge_returns_zero(self):
         self.assertEqual(self.svc.kelly_criterion(0.0, 2.0), 0.0)
@@ -207,19 +210,27 @@ class TestKellyCriterion(unittest.TestCase):
     def test_decimal_one_returns_zero(self):
         self.assertEqual(self.svc.kelly_criterion(0.10, 1.0), 0.0)
 
-    def test_high_edge_capped_at_25_pct(self):
-        # edge=0.60, decimal=5.0 → raw=0.75 → capped at 0.25
+    def test_high_edge_capped_at_6_25_pct(self):
+        # full_kelly = (0.60*5.0)/4.0 = 0.75 → quarter = 0.1875 → capped at 0.0625
         result = self.svc.kelly_criterion(0.60, 5.0)
-        self.assertAlmostEqual(result, 0.25, places=4)
+        self.assertAlmostEqual(result, 0.0625, places=4)
 
     def test_typical_minus_110_odds(self):
-        # decimal≈1.9091, edge=0.07 → kelly ≈ 0.1472
+        # full_kelly ≈ 0.1472 → quarter ≈ 0.0368
         result = self.svc.kelly_criterion(0.07, 1.9091)
-        self.assertAlmostEqual(result, 0.1472, places=3)
+        self.assertAlmostEqual(result, 0.0368, places=3)
 
     def test_result_rounded_to_4_decimals(self):
+        # full_kelly = 0.20 → quarter = 0.05
         result = self.svc.kelly_criterion(0.10, 2.0)
-        self.assertEqual(result, 0.2000)
+        self.assertEqual(result, 0.05)
+
+    def test_never_exceeds_6_25_pct(self):
+        """No matter the edge/odds, quarter-Kelly is never above 6.25%."""
+        for edge in [0.10, 0.20, 0.50, 1.0]:
+            for decimal in [1.5, 2.0, 3.0, 5.0]:
+                with self.subTest(edge=edge, decimal=decimal):
+                    self.assertLessEqual(self.svc.kelly_criterion(edge, decimal), 0.0625)
 
 
 class TestConfidence(unittest.TestCase):
@@ -1012,11 +1023,12 @@ class TestFindValueBets(unittest.TestCase):
                 self.assertEqual(bet.confidence, "Low")
 
     def test_kelly_within_bounds(self):
+        # Quarter-Kelly: max is 6.25% (0.0625)
         svc = self._make_svc(home_wins=8, away_wins=2, home_ml=130, away_ml=-160)
         bets = run(svc.find_value_bets())
         for bet in bets:
             self.assertGreaterEqual(bet.kelly_fraction, 0.0)
-            self.assertLessEqual(bet.kelly_fraction, 0.25)
+            self.assertLessEqual(bet.kelly_fraction, 0.0625)
 
     def test_team_not_found_returns_empty(self):
         game = _make_game()
@@ -1277,6 +1289,606 @@ class TestGetTeamStats(unittest.TestCase):
         result = run(self.svc.get_team_stats(9999))
         self.assertEqual(result.wins, 0)
         self.assertEqual(result.team_name, "Unknown")
+
+
+# ---------------------------------------------------------------------------
+# Group 15 — Regression: BUG-A (skip-tier filter in find_value_bets)
+# ---------------------------------------------------------------------------
+
+class TestFindValueBetsSkipTier(unittest.TestCase):
+    """fliff/espnbet must never appear as the best book in find_value_bets()."""
+
+    def _make_svc(self, lines):
+        game = _make_game()
+        odds_mock = MagicMock(spec=OddsService)
+        odds_mock.get_games = AsyncMock(return_value=[game])
+        odds_mock.get_odds = AsyncMock(return_value=lines)
+        odds_mock.get_pinnacle_odds = AsyncMock(return_value=None)  # force stats fallback
+
+        home_stats = _make_team_stats(1610612747, "Lakers", wins=7, losses=3)
+        away_stats = _make_team_stats(1610612744, "Warriors", wins=3, losses=7)
+        stats_mock = MagicMock(spec=StatsService)
+        stats_mock.find_team_by_name = MagicMock(
+            side_effect=lambda name: (
+                {"id": 1610612747, "full_name": "Los Angeles Lakers"} if "Lakers" in name
+                else {"id": 1610612744, "full_name": "Golden State Warriors"}
+            )
+        )
+        stats_mock.get_team_stats = AsyncMock(
+            side_effect=lambda tid, last_n=10: home_stats if tid == 1610612747 else away_stats
+        )
+        return _make_analysis_svc(odds_mock=odds_mock, stats_mock=stats_mock)
+
+    def test_fliff_excluded_even_if_best_odds(self):
+        """fliff offers +300 (best on paper) but must be excluded."""
+        lines = [
+            _make_odds_line("draftkings", home_ml=130, away_ml=-155),
+            _make_odds_line("fliff", home_ml=300, away_ml=-400),  # skip tier
+        ]
+        svc = self._make_svc(lines)
+        bets = run(svc.find_value_bets())
+        for bet in bets:
+            self.assertNotIn("fliff", bet.bookmaker,
+                "fliff is a sweepstakes book and must not appear in value bet results.")
+
+    def test_espnbet_excluded_even_if_best_odds(self):
+        """espnbet (defunct) must never appear in results."""
+        lines = [
+            _make_odds_line("fanduel", home_ml=120, away_ml=-145),
+            _make_odds_line("espnbet", home_ml=250, away_ml=-300),  # skip tier
+        ]
+        svc = self._make_svc(lines)
+        bets = run(svc.find_value_bets())
+        for bet in bets:
+            self.assertNotIn("espnbet", bet.bookmaker,
+                "espnbet is defunct and must not appear in value bet results.")
+
+    def test_real_book_selected_when_skip_tier_also_present(self):
+        """With fliff at +300 and DK at +130, DK should be selected."""
+        lines = [
+            _make_odds_line("draftkings", home_ml=130, away_ml=-155),
+            _make_odds_line("fliff", home_ml=300, away_ml=-400),
+        ]
+        svc = self._make_svc(lines)
+        bets = run(svc.find_value_bets())
+        home_bets = [b for b in bets if "Lakers" in b.selection]
+        if home_bets:
+            self.assertEqual(home_bets[0].bookmaker, "draftkings")
+            self.assertEqual(home_bets[0].american_odds, 130)
+
+
+# ---------------------------------------------------------------------------
+# Group 16 — Regression: Fix D (player name normalization)
+# ---------------------------------------------------------------------------
+
+class TestNormName(unittest.TestCase):
+    def setUp(self):
+        self.svc = _make_analysis_svc()
+
+    def test_lowercase(self):
+        self.assertEqual(self.svc._norm_name("LeBron James"), "lebron james")
+
+    def test_hyphen_collapsed(self):
+        self.assertEqual(
+            self.svc._norm_name("Shai Gilgeous-Alexander"),
+            "shai gilgeous alexander",
+        )
+
+    def test_period_collapsed(self):
+        self.assertEqual(self.svc._norm_name("J.J. Redick"), "j j redick")
+
+    def test_extra_spaces_collapsed(self):
+        self.assertEqual(self.svc._norm_name("  Kevin   Durant  "), "kevin durant")
+
+    def test_hyphen_and_space_match(self):
+        """The key insight: 'Foo-Bar' and 'Foo Bar' must normalize to the same string."""
+        self.assertEqual(
+            self.svc._norm_name("Shai Gilgeous-Alexander"),
+            self.svc._norm_name("Shai Gilgeous Alexander"),
+        )
+
+    def test_case_insensitive_match(self):
+        self.assertEqual(
+            self.svc._norm_name("Anthony Davis"),
+            self.svc._norm_name("anthony davis"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Group 17 — Regression: Fix E (confidence factors in book count)
+# ---------------------------------------------------------------------------
+
+class TestConfidenceWithBookCount(unittest.TestCase):
+    def setUp(self):
+        self.svc = _make_analysis_svc()
+
+    def test_thin_market_is_always_low(self):
+        """book_count < 5 → always Low regardless of edge."""
+        for edge in [0.01, 0.04, 0.08, 0.20]:
+            for count in [1, 2, 3, 4]:
+                with self.subTest(edge=edge, count=count):
+                    self.assertEqual(
+                        self.svc._confidence(edge, book_count=count), "Low",
+                        f"edge={edge}, book_count={count} should be Low (thin market).",
+                    )
+
+    def test_liquid_market_uses_edge_thresholds(self):
+        """book_count >= 5 → normal edge-based confidence."""
+        for count in [5, 6, 10, 20]:
+            with self.subTest(count=count):
+                self.assertEqual(self.svc._confidence(0.08, book_count=count), "High")
+                self.assertEqual(self.svc._confidence(0.04, book_count=count), "Medium")
+                self.assertEqual(self.svc._confidence(0.02, book_count=count), "Low")
+
+    def test_default_book_count_is_liquid(self):
+        """Default (no book_count arg) should behave as liquid market."""
+        self.assertEqual(self.svc._confidence(0.08), "High")
+        self.assertEqual(self.svc._confidence(0.04), "Medium")
+        self.assertEqual(self.svc._confidence(0.02), "Low")
+
+    def test_boundary_at_5_books(self):
+        """4 books → Low; 5 books → respects edge."""
+        self.assertEqual(self.svc._confidence(0.08, book_count=4), "Low")
+        self.assertEqual(self.svc._confidence(0.08, book_count=5), "High")
+
+
+# ---------------------------------------------------------------------------
+# Prop helpers (used by Groups 21–22)
+# ---------------------------------------------------------------------------
+
+def _make_pinnacle_prop(player_name, market, line, over_price, under_price):
+    return PlayerProp(
+        event_id="test_game", player_name=player_name, market=market, line=line,
+        over_price=over_price, under_price=under_price, bookmaker="pinnacle",
+    )
+
+
+def _make_prop(player_name, market, line, over_price, under_price, bookmaker):
+    return PlayerProp(
+        event_id="test_game", player_name=player_name, market=market, line=line,
+        over_price=over_price, under_price=under_price, bookmaker=bookmaker,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Group 18 — _downgrade_confidence
+# ---------------------------------------------------------------------------
+
+class TestDowngradeConfidence(unittest.TestCase):
+
+    def setUp(self):
+        self.svc = _make_analysis_svc()
+
+    def test_high_becomes_medium(self):
+        self.assertEqual(self.svc._downgrade_confidence("High"), "Medium")
+
+    def test_medium_becomes_low(self):
+        self.assertEqual(self.svc._downgrade_confidence("Medium"), "Low")
+
+    def test_low_stays_low(self):
+        self.assertEqual(self.svc._downgrade_confidence("Low"), "Low")
+
+
+# ---------------------------------------------------------------------------
+# Group 19 — _sync_usage_boost
+# ---------------------------------------------------------------------------
+
+class TestSyncUsageBoost(unittest.TestCase):
+
+    def setUp(self):
+        self.svc = _make_analysis_svc()
+
+    def _make_roster(self):
+        """5-player roster. Star=25%, Injured=20%, three bench players 18/17/20%."""
+        return [
+            {"player_id": 1, "team_id": 100, "usg_pct": 0.25, "player_name_lower": "star player"},
+            {"player_id": 2, "team_id": 100, "usg_pct": 0.20, "player_name_lower": "injured player"},
+            {"player_id": 3, "team_id": 100, "usg_pct": 0.18, "player_name_lower": "bench a"},
+            {"player_id": 4, "team_id": 100, "usg_pct": 0.17, "player_name_lower": "bench b"},
+            {"player_id": 5, "team_id": 100, "usg_pct": 0.20, "player_name_lower": "sixth man"},
+        ]
+
+    def test_large_boost_returns_0_012(self):
+        """Star absorbs >5% usage from injured star teammate → +0.012.
+
+        active_usg_total (excl. star pid=1, excl. injured) = 0.18+0.17+0.20 = 0.55
+        player_share = 0.25/0.55 ≈ 0.4545
+        boost = 0.4545 * 0.20 ≈ 0.0909 > 0.05 → 0.012
+        """
+        result = self.svc._sync_usage_boost(1, 0.25, self._make_roster(), {"injured player"})
+        self.assertAlmostEqual(result, 0.012, places=3)
+
+    def test_small_boost_returns_zero(self):
+        """Low-usage player with a minor injury → boost < 5% → 0.0.
+
+        active_usg_total (excl. pid=1, excl. injured) = 0.30+0.30+0.27 = 0.87
+        player_share = 0.10/0.87 ≈ 0.115
+        boost = 0.115 * 0.03 ≈ 0.003 < 0.05 → 0.0
+        """
+        roster = [
+            {"player_id": 1, "team_id": 100, "usg_pct": 0.10, "player_name_lower": "bench"},
+            {"player_id": 2, "team_id": 100, "usg_pct": 0.03, "player_name_lower": "injured"},
+            {"player_id": 3, "team_id": 100, "usg_pct": 0.30, "player_name_lower": "star a"},
+            {"player_id": 4, "team_id": 100, "usg_pct": 0.30, "player_name_lower": "star b"},
+            {"player_id": 5, "team_id": 100, "usg_pct": 0.27, "player_name_lower": "starter"},
+        ]
+        result = self.svc._sync_usage_boost(1, 0.10, roster, {"injured"})
+        self.assertAlmostEqual(result, 0.0, places=3)
+
+    def test_no_injured_players_returns_zero(self):
+        """Empty injured set → no boost regardless of roster."""
+        result = self.svc._sync_usage_boost(1, 0.25, self._make_roster(), set())
+        self.assertEqual(result, 0.0)
+
+    def test_active_usg_zero_returns_zero(self):
+        """No remaining active teammates → divide-by-zero guarded, returns 0.0."""
+        roster = [
+            {"player_id": 1, "team_id": 100, "usg_pct": 0.25, "player_name_lower": "star"},
+            {"player_id": 2, "team_id": 100, "usg_pct": 0.20, "player_name_lower": "injured"},
+            # player 1 is the subject, player 2 is injured — no active teammates remain
+        ]
+        result = self.svc._sync_usage_boost(1, 0.25, roster, {"injured"})
+        self.assertEqual(result, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Group 20 — _get_player_info_map
+# ---------------------------------------------------------------------------
+
+class TestGetPlayerInfoMap(unittest.TestCase):
+
+    _PLAYER_DATA = [
+        {"PLAYER_ID": 2544, "TEAM_ID": 1610612747, "USG_PCT": 0.30, "PLAYER_NAME": "LeBron James"},
+        {"PLAYER_ID": 1629029, "TEAM_ID": 1610612747, "USG_PCT": 0.28, "PLAYER_NAME": "Anthony Davis"},
+        {"PLAYER_ID": 203507, "TEAM_ID": 1610612744, "USG_PCT": 0.25, "PLAYER_NAME": "Shai Gilgeous-Alexander"},
+    ]
+
+    def _make_svc(self, cached_data):
+        cache = make_cache()
+        cache.get = AsyncMock(return_value=cached_data)
+        return _make_analysis_svc(stats_mock=StatsService(cache))
+
+    def test_name_map_keys_are_normalized(self):
+        """Hyphenated names collapse to spaces; keys are lowercase."""
+        svc = self._make_svc(self._PLAYER_DATA)
+        name_map, _ = run(svc._get_player_info_map())
+        self.assertIn("lebron james", name_map)
+        self.assertIn("anthony davis", name_map)
+        self.assertIn("shai gilgeous alexander", name_map)  # hyphen → space
+        # Original hyphenated key must NOT be present
+        self.assertNotIn("shai gilgeous-alexander", name_map)
+
+    def test_name_map_values_correct(self):
+        svc = self._make_svc(self._PLAYER_DATA)
+        name_map, _ = run(svc._get_player_info_map())
+        entry = name_map["lebron james"]
+        self.assertEqual(entry["player_id"], 2544)
+        self.assertEqual(entry["team_id"], 1610612747)
+        self.assertAlmostEqual(entry["usg_pct"], 0.30, places=2)
+
+    def test_team_map_groups_by_team_id(self):
+        svc = self._make_svc(self._PLAYER_DATA)
+        _, team_map = run(svc._get_player_info_map())
+        self.assertIn(1610612747, team_map)
+        self.assertIn(1610612744, team_map)
+        self.assertEqual(len(team_map[1610612747]), 2)   # LeBron + AD
+        self.assertEqual(len(team_map[1610612744]), 1)   # Shai
+
+    def test_api_failure_returns_empty_maps(self):
+        """When cache misses and nba_api raises, returns ({}, {})."""
+        from unittest.mock import patch
+        cache = make_cache()
+        cache.get = AsyncMock(return_value=None)   # force miss
+        svc = _make_analysis_svc(stats_mock=StatsService(cache))
+        with patch(
+            "nba_api.stats.endpoints.leaguedashplayerstats.LeagueDashPlayerStats",
+            side_effect=Exception("API down"),
+        ):
+            name_map, team_map = run(svc._get_player_info_map())
+        self.assertEqual(name_map, {})
+        self.assertEqual(team_map, {})
+
+
+# ---------------------------------------------------------------------------
+# Group 21 — _scan_props_ev with contextual signals (injury / B2B / defense)
+# ---------------------------------------------------------------------------
+
+class TestScanPropsEVSignals(unittest.TestCase):
+    """
+    Pinnacle: over -115 / under -105
+      imp_over = 115/215 ≈ 0.53488, imp_under = 105/205 ≈ 0.51220
+      total_vig = 1.04708
+      true_over ≈ 0.51086, true_under ≈ 0.48914
+
+    5 real books, each: over +120 / under -130
+      imp_over = 100/220 ≈ 0.45455  → edge_over ≈ 0.0563  (Medium, 5 books)
+      imp_under = 130/230 ≈ 0.56522 → edge_under ≈ -0.076  (no bet)
+    """
+    BOOKS = ["draftkings", "fanduel", "betmgm", "betrivers", "caesars"]
+    HOME_ID = 1610612747
+    AWAY_ID  = 1610612744
+
+    def setUp(self):
+        self.svc = _make_analysis_svc()
+        self.game = _make_game()
+        self.pinn_props = [_make_pinnacle_prop("LeBron James", "player_points", 27.5, -115, -105)]
+        self.props = [
+            _make_prop("LeBron James", "player_points", 27.5, 120, -130, bk)
+            for bk in self.BOOKS
+        ]
+        self.name_map = {
+            "lebron james": {
+                "player_id": 2544, "team_id": self.HOME_ID,
+                "usg_pct": 0.30, "player_name_lower": "lebron james",
+            },
+        }
+        self.team_map = {
+            self.HOME_ID: [
+                {"player_id": 2544, "team_id": self.HOME_ID,
+                 "usg_pct": 0.30, "player_name_lower": "lebron james"},
+                {"player_id": 9999, "team_id": self.HOME_ID,
+                 "usg_pct": 0.20, "player_name_lower": "anthony davis"},
+            ]
+        }
+
+    def _over_bets(self, bets):
+        return [b for b in bets if "Over" in b.selection]
+
+    # --- baseline ---
+
+    def test_baseline_produces_one_over_bet_per_book(self):
+        """Without any context signals, one Over bet per book (5 total), no Under bets."""
+        bets = self.svc._scan_props_ev(self.game, self.props, self.pinn_props, min_edge=0.01)
+        self.assertEqual(len(bets), len(self.BOOKS))
+        self.assertTrue(all("Over" in b.selection for b in bets))
+
+    def test_baseline_confidence_is_medium(self):
+        """edge ≈ 0.056 and 5 books → 'Medium'."""
+        bets = self.svc._scan_props_ev(self.game, self.props, self.pinn_props, min_edge=0.01)
+        for b in bets:
+            self.assertEqual(b.confidence, "Medium")
+
+    def test_back_to_back_is_none_when_player_not_in_name_map(self):
+        """When name_map is empty, back_to_back field is None (no team data)."""
+        bets = self.svc._scan_props_ev(self.game, self.props, self.pinn_props, min_edge=0.01)
+        for b in bets:
+            self.assertIsNone(b.back_to_back)
+
+    # --- B2B ---
+
+    def test_b2b_downgrades_medium_to_low(self):
+        bets = self.svc._scan_props_ev(
+            self.game, self.props, self.pinn_props, min_edge=0.01,
+            name_map=self.name_map, team_map=self.team_map,
+            home_team_id=self.HOME_ID, away_team_id=self.AWAY_ID,
+            home_b2b=True,
+        )
+        for b in self._over_bets(bets):
+            self.assertEqual(b.confidence, "Low", "B2B should step Medium → Low")
+
+    def test_b2b_field_set_true_on_valuebet(self):
+        bets = self.svc._scan_props_ev(
+            self.game, self.props, self.pinn_props, min_edge=0.01,
+            name_map=self.name_map, team_map=self.team_map,
+            home_team_id=self.HOME_ID, away_team_id=self.AWAY_ID,
+            home_b2b=True,
+        )
+        for b in self._over_bets(bets):
+            self.assertTrue(b.back_to_back)
+
+    def test_no_b2b_field_false_when_player_found(self):
+        bets = self.svc._scan_props_ev(
+            self.game, self.props, self.pinn_props, min_edge=0.01,
+            name_map=self.name_map, team_map=self.team_map,
+            home_team_id=self.HOME_ID, away_team_id=self.AWAY_ID,
+            home_b2b=False,
+        )
+        for b in self._over_bets(bets):
+            self.assertFalse(b.back_to_back)
+
+    # --- injury / usage boost ---
+
+    def test_injury_boost_sets_usage_boost_field(self):
+        """Injured high-usage teammate → usage_boost=0.012 on ValueBet.
+
+        active_usg_total (excl. LeBron, excl. AD) = three bench players = 0.50 total
+        player_share ≈ 0.30/0.50 = 0.60; boost = 0.60 * 0.25 = 0.15 > 0.05 → 0.012
+        """
+        team_map = {
+            self.HOME_ID: [
+                {"player_id": 2544,  "team_id": self.HOME_ID, "usg_pct": 0.30, "player_name_lower": "lebron james"},
+                {"player_id": 1234,  "team_id": self.HOME_ID, "usg_pct": 0.25, "player_name_lower": "anthony davis"},
+                {"player_id": 5678,  "team_id": self.HOME_ID, "usg_pct": 0.18, "player_name_lower": "austin reaves"},
+                {"player_id": 9012,  "team_id": self.HOME_ID, "usg_pct": 0.17, "player_name_lower": "rui hachimura"},
+                {"player_id": 3456,  "team_id": self.HOME_ID, "usg_pct": 0.10, "player_name_lower": "cam christie"},
+            ]
+        }
+        bets = self.svc._scan_props_ev(
+            self.game, self.props, self.pinn_props, min_edge=0.01,
+            name_map=self.name_map, team_map=team_map,
+            home_team_id=self.HOME_ID, away_team_id=self.AWAY_ID,
+            home_injured_lower={"anthony davis"},
+        )
+        for b in self._over_bets(bets):
+            self.assertIsNotNone(b.usage_boost)
+            self.assertAlmostEqual(b.usage_boost, 0.012, places=3)
+
+    def test_no_injury_usage_boost_is_none(self):
+        bets = self.svc._scan_props_ev(
+            self.game, self.props, self.pinn_props, min_edge=0.01,
+            name_map=self.name_map, team_map=self.team_map,
+            home_team_id=self.HOME_ID, away_team_id=self.AWAY_ID,
+        )
+        for b in self._over_bets(bets):
+            self.assertIsNone(b.usage_boost)
+
+    def test_usage_boost_directional_over_up_under_down(self):
+        """Usage boost increases Over true_prob and DECREASES Under true_prob.
+
+        Probabilities must remain individually valid (not both inflated).
+        Adjusted true probs for a boosted player: adj_over + adj_under = 1.0 still.
+        """
+        true_over, true_under = self.svc.no_vig_prob(-115, -105)
+        boost = 0.012
+        adj_over  = true_over  + boost        # Over goes up
+        adj_under = true_under - boost        # Under goes down
+        self.assertAlmostEqual(adj_over + adj_under, 1.0, places=6,
+            msg="Adjusted true probs must still sum to 1.0")
+
+    # --- opponent defense ---
+
+    def test_over_vs_elite_defense_downgrades_medium_to_low(self):
+        """LeBron (home) faces away-team elite D → Over confidence Medium → Low."""
+        away_def_ranks = {"PTS": {"rank": 3, "grade": "elite", "value": 99.5}}
+        bets = self.svc._scan_props_ev(
+            self.game, self.props, self.pinn_props, min_edge=0.01,
+            name_map=self.name_map, team_map=self.team_map,
+            home_team_id=self.HOME_ID, away_team_id=self.AWAY_ID,
+            away_def_ranks=away_def_ranks,
+        )
+        for b in self._over_bets(bets):
+            self.assertEqual(b.confidence, "Low")
+
+    def test_over_vs_weak_defense_no_downgrade(self):
+        """Weak defense → Over confidence unchanged (Medium)."""
+        away_def_ranks = {"PTS": {"rank": 28, "grade": "weak", "value": 118.0}}
+        bets = self.svc._scan_props_ev(
+            self.game, self.props, self.pinn_props, min_edge=0.01,
+            name_map=self.name_map, team_map=self.team_map,
+            home_team_id=self.HOME_ID, away_team_id=self.AWAY_ID,
+            away_def_ranks=away_def_ranks,
+        )
+        for b in self._over_bets(bets):
+            self.assertEqual(b.confidence, "Medium")
+
+    def test_opponent_def_rank_and_grade_populated(self):
+        away_def_ranks = {"PTS": {"rank": 5, "grade": "elite", "value": 100.0}}
+        bets = self.svc._scan_props_ev(
+            self.game, self.props, self.pinn_props, min_edge=0.01,
+            name_map=self.name_map, team_map=self.team_map,
+            home_team_id=self.HOME_ID, away_team_id=self.AWAY_ID,
+            away_def_ranks=away_def_ranks,
+        )
+        for b in self._over_bets(bets):
+            self.assertEqual(b.opponent_def_rank, 5)
+            self.assertEqual(b.opponent_def_grade, "elite")
+
+    def test_b2b_and_elite_defense_double_downgrade(self):
+        """B2B + elite defense → two downgrades. Need High initially (edge ≥ 0.08).
+
+        Pinnacle: over -115 / under -105 → true_over ≈ 0.5109
+        Books: over +200  → imp ≈ 0.3333  → edge ≈ 0.1776 → High
+        B2B: High → Medium; elite D on Over: Medium → Low.
+        """
+        pinn_high = [_make_pinnacle_prop("LeBron James", "player_points", 27.5, -115, -105)]
+        props_high = [
+            _make_prop("LeBron James", "player_points", 27.5, 200, -260, bk)
+            for bk in self.BOOKS
+        ]
+        away_def_ranks = {"PTS": {"rank": 3, "grade": "elite", "value": 99.5}}
+        bets = self.svc._scan_props_ev(
+            self.game, props_high, pinn_high, min_edge=0.01,
+            name_map=self.name_map, team_map=self.team_map,
+            home_team_id=self.HOME_ID, away_team_id=self.AWAY_ID,
+            home_b2b=True,
+            away_def_ranks=away_def_ranks,
+        )
+        over_bets = self._over_bets(bets)
+        self.assertGreater(len(over_bets), 0)
+        for b in over_bets:
+            # edge ≈ 0.18 → initial "High", B2B → "Medium", elite D → "Low"
+            self.assertEqual(b.confidence, "Low")
+
+
+# ---------------------------------------------------------------------------
+# Group 22 — find_positive_ev (orchestration)
+# ---------------------------------------------------------------------------
+
+class TestFindPositiveEV(unittest.TestCase):
+
+    def test_no_games_returns_empty(self):
+        odds_mock = MagicMock(spec=OddsService)
+        odds_mock.get_games = AsyncMock(return_value=[])
+        svc = _make_analysis_svc(odds_mock=odds_mock)
+        self.assertEqual(run(svc.find_positive_ev()), [])
+
+    def test_results_sorted_by_edge_descending(self):
+        """Bets from multiple games are merged and sorted by edge."""
+        from unittest.mock import patch
+
+        game1_bets = [
+            ValueBet(event_id="g1", market="h2h", selection="TeamA", bookmaker="dk",
+                     american_odds=-110, implied_probability=0.52, true_probability=0.58,
+                     edge=0.06, kelly_fraction=0.01, confidence="Medium"),
+            ValueBet(event_id="g1", market="h2h", selection="TeamB", bookmaker="dk",
+                     american_odds=150, implied_probability=0.40, true_probability=0.48,
+                     edge=0.08, kelly_fraction=0.02, confidence="High"),
+        ]
+        game2_bets = [
+            ValueBet(event_id="g2", market="h2h", selection="TeamC", bookmaker="fd",
+                     american_odds=-120, implied_probability=0.55, true_probability=0.62,
+                     edge=0.07, kelly_fraction=0.015, confidence="Medium"),
+        ]
+
+        odds_mock = MagicMock(spec=OddsService)
+        odds_mock.get_games = AsyncMock(return_value=[_make_game("g1"), _make_game("g2")])
+        svc = _make_analysis_svc(odds_mock=odds_mock)
+
+        with patch.object(svc, "_get_player_info_map", new=AsyncMock(return_value=({}, {}))):
+            with patch.object(svc, "_process_game_ev",
+                              new=AsyncMock(side_effect=[game1_bets, game2_bets])):
+                result = run(svc.find_positive_ev())
+
+        self.assertEqual(len(result), 3)
+        for i in range(len(result) - 1):
+            self.assertGreaterEqual(result[i].edge, result[i + 1].edge)
+
+    def test_player_info_map_fetched_exactly_once(self):
+        """_get_player_info_map is called once regardless of game count — not once per game."""
+        from unittest.mock import patch
+
+        games = [_make_game(f"g{i}") for i in range(3)]
+        odds_mock = MagicMock(spec=OddsService)
+        odds_mock.get_games = AsyncMock(return_value=games)
+        svc = _make_analysis_svc(odds_mock=odds_mock)
+
+        mock_info = AsyncMock(return_value=({}, {}))
+        mock_process = AsyncMock(return_value=[])
+
+        with patch.object(svc, "_get_player_info_map", new=mock_info):
+            with patch.object(svc, "_process_game_ev", new=mock_process):
+                run(svc.find_positive_ev())
+
+        mock_info.assert_called_once()
+        self.assertEqual(mock_process.call_count, 3)
+
+    def test_failed_game_does_not_abort_scan(self):
+        """If one game's processing raises, the others are still returned."""
+        from unittest.mock import patch
+
+        good_bets = [
+            ValueBet(event_id="g2", market="h2h", selection="TeamA", bookmaker="dk",
+                     american_odds=-110, implied_probability=0.52, true_probability=0.58,
+                     edge=0.06, kelly_fraction=0.01, confidence="Medium"),
+        ]
+
+        games = [_make_game("g1"), _make_game("g2")]
+        odds_mock = MagicMock(spec=OddsService)
+        odds_mock.get_games = AsyncMock(return_value=games)
+        svc = _make_analysis_svc(odds_mock=odds_mock)
+
+        async def side_effect(game, *args, **kwargs):
+            if game.id == "g1":
+                raise RuntimeError("simulated timeout")
+            return good_bets
+
+        with patch.object(svc, "_get_player_info_map", new=AsyncMock(return_value=({}, {}))):
+            with patch.object(svc, "_process_game_ev",
+                              new=AsyncMock(side_effect=side_effect)):
+                result = run(svc.find_positive_ev())
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].event_id, "g2")
 
 
 if __name__ == "__main__":

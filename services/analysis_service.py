@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import statistics
@@ -27,6 +28,36 @@ _BOOK_GROUP: dict[str, str] = {
     "hardrockbet_fl": "hardrockbet",
     "hardrockbet_az": "hardrockbet",
     "lowvig": "betonlineag",
+}
+
+# Maps prop market name → nba_api stat category used for opponent defensive rank
+_MARKET_STAT: dict[str, str] = {
+    "player_points": "PTS",
+    "player_rebounds": "REB",
+    "player_assists": "AST",
+    "player_threes": "FG3M",
+}
+
+# Book quality tiers for filtering and flagging
+# skip  = not real money or defunct — exclude from EV/arb entirely
+# pm    = prediction market — include but flag with [PM]
+# exchange = no-vig but thin/slow — include but flag with [EX]
+# sharp/standard = real sportsbooks — include normally
+_BOOK_TIER: dict[str, str] = {
+    # Sharp reference books
+    "pinnacle": "sharp",
+    "betonlineag": "sharp",
+    "lowvig": "sharp",
+    # Exchange / no-vig (thin liquidity)
+    "novig": "exchange",
+    "betopenly": "exchange",
+    "prophetx": "exchange",
+    # Prediction markets
+    "kalshi": "pm",
+    "polymarket": "pm",
+    # Skip entirely
+    "fliff": "skip",       # sweepstakes, not real money
+    "espnbet": "skip",     # defunct Dec 2025
 }
 
 
@@ -69,24 +100,55 @@ class AnalysisService:
         return true_prob - implied_prob
 
     def kelly_criterion(self, edge: float, decimal_odds: float) -> float:
-        """Kelly fraction = (edge * decimal_odds) / (decimal_odds - 1).
-        Capped at 25% and returned as a fraction (e.g. 0.05 = 5%).
+        """Quarter-Kelly fraction = full_kelly * 0.25.
+        Quarter-Kelly accounts for model estimation error; full Kelly is too aggressive
+        for sports betting where true probabilities are uncertain.
+        Capped at 6.25% (quarter of 25%) and returned as a fraction (e.g. 0.05 = 5%).
         """
         if decimal_odds <= 1 or edge <= 0:
             return 0.0
-        kelly = (edge * decimal_odds) / (decimal_odds - 1)
-        return round(min(kelly, 0.25), 4)
+        full_kelly = (edge * decimal_odds) / (decimal_odds - 1)
+        return round(min(full_kelly * 0.25, 0.0625), 4)
+
+    @staticmethod
+    def _norm_name(name: str) -> str:
+        """Normalize a player name for fuzzy matching: lowercase, collapse whitespace, drop hyphens/periods."""
+        import re
+        return re.sub(r"[\s\-\.]+", " ", name).strip().lower()
 
     def _canonical_book(self, book: str) -> str:
         """Normalize regional book variants to their parent operator."""
         return _BOOK_GROUP.get(book, book)
 
-    def _confidence(self, edge: float) -> str:
+    def _book_tier(self, book: str) -> str:
+        """Return quality tier for a book. Unlisted books default to 'standard'."""
+        return _BOOK_TIER.get(book, "standard")
+
+    def _book_flag(self, book: str) -> str:
+        """Return display flag suffix for non-standard books."""
+        tier = self._book_tier(book)
+        if tier == "pm":
+            return " [PM]"
+        if tier == "exchange":
+            return " [EX]"
+        return ""
+
+    def _confidence(self, edge: float, book_count: int = 10) -> str:
+        """Confidence based on edge size and market liquidity.
+        book_count < 5 caps at Low regardless of edge — thin markets mean
+        the Pinnacle reference line is less reliable.
+        """
+        if book_count < 5:
+            return "Low"
         if edge >= 0.08:
             return "High"
         if edge >= 0.04:
             return "Medium"
         return "Low"
+
+    def _downgrade_confidence(self, conf: str) -> str:
+        """Step confidence down one level: High→Medium, Medium/Low→Low."""
+        return "Medium" if conf == "High" else "Low"
 
     # ------------------------------------------------------------------
     # Value bet finders
@@ -108,6 +170,8 @@ class AnalysisService:
             home_book_odds: list[tuple[str, int]] = []  # (bookmaker, price)
             away_book_odds: list[tuple[str, int]] = []
             for line in lines:
+                if self._book_tier(line.bookmaker) == "skip":
+                    continue
                 if line.moneyline_home is not None:
                     home_book_odds.append((line.bookmaker, line.moneyline_home))
                 if line.moneyline_away is not None:
@@ -249,6 +313,8 @@ class AnalysisService:
         best_home: dict = {}  # bookmaker -> price
         best_away: dict = {}
         for line in lines:
+            if self._book_tier(line.bookmaker) == "skip":
+                continue
             if line.moneyline_home is not None:
                 if not best_home or self.american_to_decimal(line.moneyline_home) > self.american_to_decimal(best_home["price"]):
                     best_home = {"book": line.bookmaker, "price": line.moneyline_home}
@@ -343,6 +409,8 @@ class AnalysisService:
         # Group by (player_name, market, line)
         groups: dict[tuple, dict] = {}
         for p in props:
+            if self._book_tier(p.bookmaker) == "skip":
+                continue
             if p.over_price > _MAX_PROP_ODDS or p.under_price > _MAX_PROP_ODDS:
                 continue
             key = (p.player_name, p.market, p.line)
@@ -387,28 +455,25 @@ class AnalysisService:
     async def find_positive_ev(self, min_edge: float = 0.01) -> list[ValueBet]:
         """Scan all upcoming games for +EV bets using Pinnacle no-vig as true probability.
         Covers game lines (h2h, spreads, totals) and player props.
+        Games are processed concurrently via asyncio.gather.
         """
         games = await self.odds.get_games()
+        if not games:
+            return []
+
+        # Fetch player usage data once — shared across all games
+        name_map, team_map = await self._get_player_info_map()
+
+        results = await asyncio.gather(
+            *[self._process_game_ev(game, min_edge, name_map, team_map) for game in games],
+            return_exceptions=True,
+        )
         ev_bets: list[ValueBet] = []
-
-        for game in games:
-            # --- Game lines ---
-            try:
-                pinnacle = await self.odds.get_pinnacle_odds(game.id)
-                if pinnacle:
-                    lines = await self.odds.get_odds(game.id)
-                    ev_bets.extend(self._scan_game_ev(game, lines, pinnacle, min_edge))
-            except Exception as exc:
-                logger.warning("+EV scan (game lines) failed for %s: %s", game.id, exc)
-
-            # --- Player props ---
-            try:
-                pinnacle_props = await self.odds.get_pinnacle_props(game.id)
-                if pinnacle_props:
-                    props = await self.odds.get_player_props(game.id)
-                    ev_bets.extend(self._scan_props_ev(game, props, pinnacle_props, min_edge))
-            except Exception as exc:
-                logger.warning("+EV scan (props) failed for %s: %s", game.id, exc)
+        for game, res in zip(games, results):
+            if isinstance(res, Exception):
+                logger.warning("+EV scan failed for %s: %s", game.id, res)
+            else:
+                ev_bets.extend(res)
 
         ev_bets.sort(key=lambda b: b.edge, reverse=True)
         return ev_bets
@@ -424,6 +489,8 @@ class AnalysisService:
             for line in lines:
                 if line.bookmaker == "pinnacle":
                     continue
+                if self._book_tier(line.bookmaker) == "skip":
+                    continue
                 for team, true_prob, odds in [
                     (game.home_team, true_home, line.moneyline_home),
                     (game.away_team, true_away, line.moneyline_away),
@@ -436,7 +503,7 @@ class AnalysisService:
                         dec = self.american_to_decimal(odds)
                         bets.append(ValueBet(
                             event_id=game.id, market="h2h", selection=team,
-                            bookmaker=line.bookmaker, american_odds=odds,
+                            bookmaker=line.bookmaker + self._book_flag(line.bookmaker), american_odds=odds,
                             implied_probability=round(imp, 4),
                             true_probability=round(true_prob, 4),
                             edge=round(edge, 4),
@@ -449,6 +516,8 @@ class AnalysisService:
             pinn_home_p, pinn_away_p = self.no_vig_prob(pinnacle.spread.home_price, pinnacle.spread.away_price)
             for line in lines:
                 if line.bookmaker == "pinnacle" or not line.spread:
+                    continue
+                if self._book_tier(line.bookmaker) == "skip":
                     continue
                 if (
                     line.spread.home_point != pinnacle.spread.home_point
@@ -466,7 +535,7 @@ class AnalysisService:
                         bets.append(ValueBet(
                             event_id=game.id, market="spreads",
                             selection=f"{team} {point:+.1f}",
-                            bookmaker=line.bookmaker, american_odds=odds,
+                            bookmaker=line.bookmaker + self._book_flag(line.bookmaker), american_odds=odds,
                             implied_probability=round(imp, 4),
                             true_probability=round(true_prob, 4),
                             edge=round(edge, 4),
@@ -479,6 +548,8 @@ class AnalysisService:
             pinn_over_p, pinn_under_p = self.no_vig_prob(pinnacle.total.over_price, pinnacle.total.under_price)
             for line in lines:
                 if line.bookmaker == "pinnacle" or not line.total:
+                    continue
+                if self._book_tier(line.bookmaker) == "skip":
                     continue
                 if line.total.point != pinnacle.total.point:
                     continue
@@ -493,7 +564,7 @@ class AnalysisService:
                         bets.append(ValueBet(
                             event_id=game.id, market="totals",
                             selection=f"{side} {pinnacle.total.point}",
-                            bookmaker=line.bookmaker, american_odds=odds,
+                            bookmaker=line.bookmaker + self._book_flag(line.bookmaker), american_odds=odds,
                             implied_probability=round(imp, 4),
                             true_probability=round(true_prob, 4),
                             edge=round(edge, 4),
@@ -503,52 +574,298 @@ class AnalysisService:
         return bets
 
     def _scan_props_ev(
-        self, game: Any, props: list, pinnacle_props: list, min_edge: float
+        self, game: Any, props: list, pinnacle_props: list, min_edge: float,
+        *,
+        name_map: dict | None = None,
+        team_map: dict | None = None,
+        home_team_id: int | None = None,
+        away_team_id: int | None = None,
+        home_injured_lower: set | None = None,
+        away_injured_lower: set | None = None,
+        home_b2b: bool = False,
+        away_b2b: bool = False,
+        home_def_ranks: dict | None = None,
+        away_def_ranks: dict | None = None,
     ) -> list[ValueBet]:
-        # Build Pinnacle no-vig map keyed by (player_name, market, line)
+        # Build Pinnacle no-vig map keyed by (normalized_player_name, market, line)
         pinn_map: dict[tuple, tuple[float, float]] = {}
         for pp in pinnacle_props:
             if pp.over_price > _MAX_PROP_ODDS or pp.under_price > _MAX_PROP_ODDS:
                 continue
             true_over, true_under = self.no_vig_prob(pp.over_price, pp.under_price)
-            pinn_map[(pp.player_name, pp.market, pp.line)] = (true_over, true_under)
+            pinn_map[(self._norm_name(pp.player_name), pp.market, pp.line)] = (true_over, true_under)
+
+        # Count how many non-skip books offer each (normalized_name, market, line) — thin markets skipped
+        book_count: dict[tuple, int] = {}
+        for p in props:
+            if self._book_tier(p.bookmaker) == "skip":
+                continue
+            key = (self._norm_name(p.player_name), p.market, p.line)
+            book_count[key] = book_count.get(key, 0) + 1
+
+        _name_map = name_map or {}
+        _team_map = team_map or {}
+        _home_inj = home_injured_lower or set()
+        _away_inj = away_injured_lower or set()
+        _home_def = home_def_ranks or {}
+        _away_def = away_def_ranks or {}
 
         bets: list[ValueBet] = []
         for p in props:
             if p.bookmaker == "pinnacle":
                 continue
+            if self._book_tier(p.bookmaker) == "skip":
+                continue
             if p.over_price > _MAX_PROP_ODDS or p.under_price > _MAX_PROP_ODDS:
                 continue
-            key = (p.player_name, p.market, p.line)
+            key = (self._norm_name(p.player_name), p.market, p.line)
+            if book_count.get(key, 0) < 3:
+                continue  # thin market — unreliable Pinnacle reference
             if key not in pinn_map:
                 continue
             true_over, true_under = pinn_map[key]
+            n_books = book_count.get(key, 0)
+
+            # --- Contextual signals ---
+            player_info = _name_map.get(self._norm_name(p.player_name))
+            player_team_id = player_info["team_id"] if player_info else None
+            is_home = player_team_id == home_team_id and home_team_id is not None
+            is_away = player_team_id == away_team_id and away_team_id is not None
+
+            # Usage boost from injured teammates
+            usage_boost = 0.0
+            if player_info and (is_home or is_away):
+                injured_lower = _home_inj if is_home else _away_inj
+                team_players = _team_map.get(player_team_id, [])
+                usage_boost = self._sync_usage_boost(
+                    player_info["player_id"], player_info["usg_pct"],
+                    team_players, injured_lower,
+                )
+
+            # Back-to-back flag
+            is_b2b = (is_home and home_b2b) or (is_away and away_b2b)
+
+            # Opponent defensive rank for the relevant stat category
+            stat_cat = _MARKET_STAT.get(p.market)
+            opp_def: dict = {}
+            if stat_cat:
+                opp_def = (_away_def if is_home else _home_def).get(stat_cat, {})
+
             for side, true_prob, odds in [
                 ("Over", true_over, p.over_price),
                 ("Under", true_under, p.under_price),
             ]:
+                # Usage boost is directional: more usage → more likely to score Over,
+                # less likely to go Under. Negate for Under so probabilities stay valid.
+                direction = 1.0 if side == "Over" else -1.0
+                adj_true_prob = true_prob + direction * usage_boost
                 imp = self.implied_probability(odds)
-                edge = true_prob - imp
+                edge = adj_true_prob - imp
                 if edge >= min_edge:
                     dec = self.american_to_decimal(odds)
-                    flag = " ⚠" if _WARN_PROP_ODDS < odds <= _MAX_PROP_ODDS else ""
+                    odds_flag = " ⚠" if _WARN_PROP_ODDS < odds <= _MAX_PROP_ODDS else ""
+                    conf = self._confidence(edge, book_count=n_books)
+                    if is_b2b:
+                        conf = self._downgrade_confidence(conf)
+                    if side == "Over" and opp_def.get("grade") == "elite":
+                        conf = self._downgrade_confidence(conf)
+                    elif side == "Under" and opp_def.get("grade") == "weak":
+                        conf = self._downgrade_confidence(conf)
                     bets.append(ValueBet(
                         event_id=game.id,
                         market=p.market,
-                        selection=f"{p.player_name} {side} {p.line}{flag}",
-                        bookmaker=p.bookmaker,
+                        selection=f"{p.player_name} {side} {p.line}{odds_flag}",
+                        bookmaker=p.bookmaker + self._book_flag(p.bookmaker),
                         american_odds=odds,
                         implied_probability=round(imp, 4),
-                        true_probability=round(true_prob, 4),
+                        true_probability=round(adj_true_prob, 4),
                         edge=round(edge, 4),
                         kelly_fraction=self.kelly_criterion(edge, dec),
-                        confidence=self._confidence(edge),
+                        confidence=conf,
+                        back_to_back=is_b2b if player_info else None,
+                        usage_boost=round(usage_boost, 4) if usage_boost != 0.0 else None,
+                        opponent_def_rank=opp_def.get("rank"),
+                        opponent_def_grade=opp_def.get("grade"),
                     ))
         return bets
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    async def _process_game_ev(
+        self, game: Any, min_edge: float,
+        name_map: dict, team_map: dict,
+    ) -> list[ValueBet]:
+        """Fetch all data for one game concurrently, then scan game lines and props for +EV."""
+        bets: list[ValueBet] = []
+
+        async def safe(coro, fallback=None):
+            try:
+                return await coro
+            except Exception as exc:
+                logger.warning("_process_game_ev fetch failed (%s): %s", game.id, exc)
+                return fallback
+
+        # Resolve nba_api team IDs synchronously
+        home_data = self.stats.find_team_by_name(game.home_team)
+        away_data = self.stats.find_team_by_name(game.away_team)
+        home_team_id: int | None = home_data["id"] if home_data else None
+        away_team_id: int | None = away_data["id"] if away_data else None
+        game_date = game.commence_time.date()
+
+        # --- Phase 1: fetch odds, props, injuries, B2B concurrently ---
+        async def noop(val=None):
+            return val
+
+        (pinnacle, lines, pinnacle_props, props,
+         home_injury, away_injury,
+         home_b2b, away_b2b) = await asyncio.gather(
+            safe(self.odds.get_pinnacle_odds(game.id), None),
+            safe(self.odds.get_odds(game.id), []),
+            safe(self.odds.get_pinnacle_props(game.id), []),
+            safe(self.odds.get_player_props(game.id), []),
+            safe(self.stats.get_injury_report(home_team_id)) if home_team_id else noop(None),
+            safe(self.stats.get_injury_report(away_team_id)) if away_team_id else noop(None),
+            safe(self.stats.is_team_on_back_to_back(home_team_id, game_date), False) if home_team_id else noop(False),
+            safe(self.stats.is_team_on_back_to_back(away_team_id, game_date), False) if away_team_id else noop(False),
+        )
+
+        # Build injured-player name sets (lowercase) for each team
+        home_injured_lower: set[str] = set()
+        if home_injury:
+            home_injured_lower = {
+                p.player_name.lower() for p in home_injury.players
+                if p.status in ("Out", "Doubtful")
+            }
+        away_injured_lower: set[str] = set()
+        if away_injury:
+            away_injured_lower = {
+                p.player_name.lower() for p in away_injury.players
+                if p.status in ("Out", "Doubtful")
+            }
+
+        # --- Phase 2: defensive ranks for both teams, all stat categories ---
+        home_def_ranks: dict[str, dict] = {}
+        away_def_ranks: dict[str, dict] = {}
+        if self.defense_service:
+            stat_cats = list(_MARKET_STAT.values())
+            def_coros = []
+            def_keys: list[tuple[str, str]] = []
+            for sc in stat_cats:
+                if home_team_id:
+                    def_coros.append(safe(self.defense_service.get_opponent_def_rank(home_team_id, sc), {}))
+                    def_keys.append(("home", sc))
+                if away_team_id:
+                    def_coros.append(safe(self.defense_service.get_opponent_def_rank(away_team_id, sc), {}))
+                    def_keys.append(("away", sc))
+            if def_coros:
+                def_results = await asyncio.gather(*def_coros)
+                for (side, sc), res in zip(def_keys, def_results):
+                    if side == "home":
+                        home_def_ranks[sc] = res or {}
+                    else:
+                        away_def_ranks[sc] = res or {}
+
+        # --- Scan game lines ---
+        if pinnacle and lines:
+            bets.extend(self._scan_game_ev(game, lines, pinnacle, min_edge))
+
+        # --- Scan player props ---
+        if pinnacle_props and props:
+            bets.extend(self._scan_props_ev(
+                game, props, pinnacle_props, min_edge,
+                name_map=name_map,
+                team_map=team_map,
+                home_team_id=home_team_id,
+                away_team_id=away_team_id,
+                home_injured_lower=home_injured_lower,
+                away_injured_lower=away_injured_lower,
+                home_b2b=bool(home_b2b),
+                away_b2b=bool(away_b2b),
+                home_def_ranks=home_def_ranks,
+                away_def_ranks=away_def_ranks,
+            ))
+
+        return bets
+
+    async def _get_player_info_map(
+        self,
+    ) -> tuple[dict[str, dict], dict[int, list[dict]]]:
+        """Fetch LeagueDashPlayerStats (Advanced) and return two indexes.
+
+        Returns:
+            name_map:  {norm_name: {player_id, team_id, usg_pct, player_name_lower}}
+            team_map:  {team_id: [player dicts]}  — for usage-boost teammate lookup
+        """
+        cache_key = f"league_player_stats:{settings.nba_season}"
+        player_stats_data = await self.stats.cache.get(cache_key)
+        if not player_stats_data:
+            try:
+                print("[API CALL]   nba_api → LeagueDashPlayerStats (Advanced, PerGame)")
+                from nba_api.stats.endpoints import leaguedashplayerstats
+
+                result = leaguedashplayerstats.LeagueDashPlayerStats(
+                    season=settings.nba_season,
+                    measure_type_detailed_defense="Advanced",
+                    per_mode_detailed="PerGame",
+                )
+                df = result.league_dash_player_stats.get_data_frame()
+                player_stats_data = df.to_dict(orient="records")
+                await self.stats.cache.set(cache_key, player_stats_data, STATS)
+            except Exception as exc:
+                logger.warning("_get_player_info_map: LeagueDashPlayerStats failed: %s", exc)
+                return {}, {}
+
+        name_map: dict[str, dict] = {}
+        team_map: dict[int, list[dict]] = {}
+        for row in player_stats_data:
+            pid = row.get("PLAYER_ID")
+            tid = row.get("TEAM_ID")
+            pname = str(row.get("PLAYER_NAME") or "")
+            usg = float(row.get("USG_PCT") or 0)
+            entry = {
+                "player_id": pid,
+                "team_id": tid,
+                "usg_pct": usg,
+                "player_name_lower": pname.lower(),
+            }
+            name_map[self._norm_name(pname)] = entry
+            if tid is not None:
+                team_map.setdefault(tid, []).append(entry)
+
+        return name_map, team_map
+
+    def _sync_usage_boost(
+        self,
+        player_id: int,
+        usg_pct: float,
+        team_players: list[dict],
+        injured_lower: set[str],
+    ) -> float:
+        """Synchronous usage-boost calculation for a player given injured teammates.
+
+        Returns +0.012 edge delta if the player absorbs >5% usage from injuries,
+        -0.012 if key teammates returning would reduce their usage, else 0.0.
+        """
+        out_players = [p for p in team_players if p["player_name_lower"] in injured_lower]
+        active_teammates = [
+            p for p in team_players
+            if p["player_id"] != player_id and p["player_name_lower"] not in injured_lower
+        ]
+        total_out_usg = sum(p["usg_pct"] for p in out_players)
+        if total_out_usg == 0:
+            return 0.0
+        active_usg_total = sum(p["usg_pct"] for p in active_teammates)
+        if active_usg_total == 0:
+            return 0.0
+        player_share = usg_pct / active_usg_total
+        boost = player_share * total_out_usg
+        if boost > 0.05:
+            return 0.012
+        if boost < -0.05:
+            return -0.012
+        return 0.0
 
     async def _calculate_usage_adjustment(
         self,

@@ -341,18 +341,18 @@ class OddsService:
             "%Y-%m-%dT%H:%M:%SZ"
         )
 
-        opening_point = current_point  # fallback (historical lookup disabled)
-        # hist = await self.get_historical_event_odds(event_id, opening_ts, markets=["spreads"])
-        # hist_data = hist.get("data") or {}
-        # for bookmaker in hist_data.get("bookmakers", []):
-        #     for market in bookmaker.get("markets", []):
-        #         if market.get("key") == "spreads":
-        #             for outcome in market.get("outcomes", []):
-        #                 if "point" in outcome:
-        #                     opening_point = float(outcome["point"])
-        #                     break
-        #             break
-        #     break
+        opening_point = current_point  # fallback if historical lookup fails
+        hist = await self.get_historical_event_odds(event_id, opening_ts, markets=["spreads"])
+        hist_data = (hist.get("data") or {}) if hist else {}
+        for bookmaker in hist_data.get("bookmakers", []):
+            for market in bookmaker.get("markets", []):
+                if market.get("key") == "spreads":
+                    for outcome in market.get("outcomes", []):
+                        if "point" in outcome:
+                            opening_point = float(outcome["point"])
+                            break
+                    break
+            break
 
         delta = current_point - opening_point
         direction = "Up" if delta > 0 else ("Down" if delta < 0 else "Flat")
